@@ -1,4 +1,15 @@
+#data
+data/HF_dataset/
+data/vicocktail/
+papers/
+
+
+
+data/.hf
+data/Vicocktail/
+
 # Byte-compiled / optimized / DLL files
+
 __pycache__/
 *.py[codz]
 *$py.class
