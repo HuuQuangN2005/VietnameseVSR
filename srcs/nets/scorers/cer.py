@@ -1,8 +1,9 @@
 import editdistance
 
 
-class WER:
-    def __init__(self):
+class CER:
+    def __init__(self, remove_space=False):
+        self.remove_space = remove_space
         self.reset()
 
     def reset(self):
@@ -11,8 +12,11 @@ class WER:
 
     def update(self, predictions, references):
         for hypothesis, reference in zip(predictions, references):
-            hypothesis = hypothesis.lower().split()
-            reference = reference.lower().split()
+            hypothesis = hypothesis.lower()
+            reference = reference.lower()
+            if self.remove_space:
+                hypothesis = hypothesis.replace(" ", "")
+                reference = reference.replace(" ", "")
             self.edits += editdistance.eval(hypothesis, reference)
             self.total += len(reference)
 

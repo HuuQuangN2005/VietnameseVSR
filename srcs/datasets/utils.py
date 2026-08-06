@@ -1,37 +1,48 @@
 import os
-from dotenv import load_dotenv, find_dotenv
+from collections.abc import Sequence
 
-load_dotenv(find_dotenv())
-
-PROJECT_PATH = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
-
-DATA_PATH = os.path.join(PROJECT_PATH, "data")
-os.makedirs(DATA_PATH, exist_ok=True)
+import torch
+from dotenv import find_dotenv, load_dotenv
 
 
-def setup_hf(dataset_dir: str = DATA_PATH) -> dict:
-    hf_path = os.path.join(dataset_dir, ".hf")
-    cache_path = os.path.join(hf_path, ".cache")
+def root_dir():
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-    configs = {
-        "HF_TOKEN": os.getenv("HF_TOKEN"),
-        "HF_HOME": hf_path,
-        "HF_HUB_CACHE": os.path.join(cache_path, "hub"),
-        "HF_DATASETS_CACHE": os.path.join(cache_path, "datasets"),
-        "HF_ASSETS_CACHE": os.path.join(cache_path, "assets"),
-        "HF_XET_CACHE": os.path.join(cache_path, "xet"),
+
+def setup_hf(cache_dir=None):
+    load_dotenv(find_dotenv())
+    base = cache_dir or os.path.join(root_dir(), "data", ".hf")
+    cache = os.path.join(base, ".cache")
+    config = {
+        "HF_HOME": base,
+        "HF_HUB_CACHE": os.path.join(cache, "hub"),
+        "HF_DATASETS_CACHE": os.path.join(cache, "datasets"),
+        "HF_ASSETS_CACHE": os.path.join(cache, "assets"),
+        "HF_XET_CACHE": os.path.join(cache, "xet"),
     }
+    token = os.getenv("HF_TOKEN")
+    for key, value in config.items():
+        os.makedirs(value, exist_ok=True)
+        os.environ[key] = value
+    if token:
+        os.environ["HF_TOKEN"] = token
+        config["HF_TOKEN"] = token
+    return config
 
-    for k, v in configs.items():
-        if k == "HF_TOKEN":
-            if v is None:
-                continue
-            else:
-                os.environ[k] = v
-        else:
-            os.makedirs(v, exist_ok=True)
-            os.environ[k] = v
 
-    return configs
+def to_text(value):
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8")
+    return str(value)
+
+
+def pad_seq(sequences: Sequence[torch.Tensor], padding_value=0.0):
+    if not sequences:
+        raise ValueError("sequences must not be empty")
+    lengths = torch.tensor([item.size(0) for item in sequences], dtype=torch.long)
+    max_length = int(lengths.max())
+    shape = (len(sequences), max_length, *sequences[0].shape[1:])
+    output = sequences[0].new_full(shape, padding_value)
+    for index, item in enumerate(sequences):
+        output[index, : item.size(0)] = item
+    return output, lengths
