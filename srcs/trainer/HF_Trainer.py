@@ -5,11 +5,10 @@ from contextlib import contextmanager
 
 import numpy as np
 import torch
+from torchmetrics.text import WordErrorRate
 from transformers import Trainer
 
-from srcs.nets.scorers.cer import CER
-from srcs.nets.scorers.ctc import ctc_decode
-from srcs.nets.scorers.wer import WER
+from srcs.nets.utils import ctc_decode
 
 
 class HFTrainer(Trainer):
@@ -37,20 +36,32 @@ class HFTrainer(Trainer):
             return super().get_test_dataloader(test_dataset)
 
 
+def preprocess_logits_for_metrics(logits, labels):
+    del labels
+    if isinstance(logits, (tuple, list)):
+        scores = logits[0]
+        input_lengths = logits[1] if len(logits) > 1 else None
+    else:
+        scores = logits
+        input_lengths = None
+    frame_ids = scores.argmax(dim=-1)
+    return frame_ids if input_lengths is None else (frame_ids, input_lengths)
+
+
 def build_metric_fn(text_transform):
     def compute(eval_pred):
         predictions = eval_pred.predictions
         if isinstance(predictions, (tuple, list)):
-            logits = predictions[0]
+            frame_ids = predictions[0]
             input_lengths = predictions[1] if len(predictions) > 1 else None
         else:
-            logits = predictions
+            frame_ids = predictions
             input_lengths = None
-        logits = np.asarray(logits)
+        frame_ids = np.asarray(frame_ids)
         if input_lengths is not None:
             input_lengths = np.asarray(input_lengths)
         token_ids = ctc_decode(
-            torch.from_numpy(logits),
+            torch.from_numpy(frame_ids),
             None if input_lengths is None else torch.from_numpy(input_lengths),
             text_transform.blank_id,
         )
@@ -61,17 +72,12 @@ def build_metric_fn(text_transform):
         labels = np.asarray(labels)
         hypotheses = [text_transform.decode(item) for item in token_ids]
         if label_lengths is None:
-            references = [
-                text_transform.decode(item[item != -1]) for item in labels
-            ]
+            references = [text_transform.decode(item[item != -1]) for item in labels]
         else:
             references = [
                 text_transform.decode(item[: int(size)])
                 for item, size in zip(labels, label_lengths)
             ]
-        return {
-            "wer": WER()(hypotheses, references),
-            "cer": CER()(hypotheses, references),
-        }
+        return {"wer": WordErrorRate()(hypotheses, references).item()}
 
     return compute

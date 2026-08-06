@@ -5,17 +5,14 @@ import random
 from collections import Counter
 from dataclasses import dataclass
 
-import torch
-import torchvision
-from datasets import DatasetDict, concatenate_datasets
+from datasets import DatasetDict
 from datasets import load_dataset as hf_load_dataset
-from torchcodec.decoders import VideoDecoder
 
+from srcs.datasets.transform import VideoTransform, load_video
 from srcs.datasets.utils import pad_seq, setup_hf, to_text
 from srcs.spm.text_transofm import TextTransform
 
-DATASETS = ("vicocktail",)
-HF_NAMES = {"vicocktail": "nguyenvulebinh/ViCocktail"}
+HF_NAME = "nguyenvulebinh/ViCocktail"
 
 
 def _source(sample_id):
@@ -41,17 +38,13 @@ def _split_validation(dataset, validation_size, seed):
         raise ValueError("validation_size must be in (0, 1).")
 
     if "sample_id" not in dataset.column_names:
-        split_dataset = dataset.train_test_split(
-            test_size=validation_size, seed=seed
-        )
+        split_dataset = dataset.train_test_split(test_size=validation_size, seed=seed)
         return split_dataset["train"], split_dataset["test"]
 
     source_ids = [_source(item) for item in dataset["sample_id"]]
     source_counts = Counter(source_ids)
     if len(source_counts) < 2:
-        split_dataset = dataset.train_test_split(
-            test_size=validation_size, seed=seed
-        )
+        split_dataset = dataset.train_test_split(test_size=validation_size, seed=seed)
         return split_dataset["train"], split_dataset["test"]
 
     source_keys = list(source_counts)
@@ -71,29 +64,34 @@ def _split_validation(dataset, validation_size, seed):
     validation_indices = []
 
     for index, key in enumerate(source_ids):
-        target_indices = (
-            validation_indices if key in validation_keys else train_indices
-        )
+        target_indices = validation_indices if key in validation_keys else train_indices
         target_indices.append(index)
 
     if not train_indices or not validation_indices:
-        split_dataset = dataset.train_test_split(
-            test_size=validation_size, seed=seed
-        )
+        split_dataset = dataset.train_test_split(test_size=validation_size, seed=seed)
         return split_dataset["train"], split_dataset["test"]
 
     return dataset.select(train_indices), dataset.select(validation_indices)
 
 
 def _clean(dataset):
-    columns = [
-        name for name in ("__key__", "__url__") if name in dataset.column_names
-    ]
+    columns = [name for name in ("__key__", "__url__") if name in dataset.column_names]
     return dataset.remove_columns(columns) if columns else dataset
 
 
-def load_dataset(
-    name="all",
+def _add_video_length(dataset):
+    if "video_length" in dataset.column_names:
+        return dataset
+    if "length" not in dataset.column_names:
+        raise ValueError("The dataset must contain a length column.")
+
+    video_lengths = []
+    for value in dataset["length"]:
+        video_lengths.append(int(to_text(value)))
+    return dataset.add_column("video_length", video_lengths)
+
+
+def load_vicocktail(
     train_fraction=1.0,
     validation_fraction=1.0,
     test_fraction=1.0,
@@ -102,139 +100,48 @@ def load_dataset(
     cache_dir=None,
     splits=("train", "val", "test"),
 ):
-    if name not in (*DATASETS, "all"):
-        raise ValueError(f"Unsupported dataset: {name}")
-
     config = setup_hf(cache_dir)
     splits = tuple(splits)
 
     if not set(splits).issubset({"train", "val", "test"}):
         raise ValueError("splits can only contain train, val, and test.")
 
-    names = DATASETS if name == "all" else (name,)
-
-    train_datasets = []
-    validation_datasets = []
-    test_datasets = []
-
-    for dataset_name in names:
-        dataset = hf_load_dataset(
-            HF_NAMES[dataset_name],
-            streaming=False,
-            cache_dir=config["HF_DATASETS_CACHE"],
-        )
-        if "train" in splits or "val" in splits:
-            train_dataset, validation_dataset = _split_validation(
-                _clean(dataset["train"]), validation_size, seed
-            )
-
-            if "train" in splits:
-                train_datasets.append(
-                    _select_fraction(train_dataset, train_fraction, seed)
-                )
-
-            if "val" in splits:
-                validation_datasets.append(
-                    _select_fraction(validation_dataset, validation_fraction, seed)
-                )
-
-        if "test" in splits and "test" in dataset:
-            test_datasets.append(
-                _select_fraction(_clean(dataset["test"]), test_fraction, seed)
-            )
-
     output = DatasetDict()
 
-    if train_datasets:
-        output["train"] = (
-            train_datasets[0]
-            if len(train_datasets) == 1
-            else concatenate_datasets(train_datasets)
+    if "train" in splits or "val" in splits:
+        train_source = hf_load_dataset(
+            HF_NAME, split="train", streaming=False, cache_dir=config["HF_DATASETS_CACHE"]
+        )
+        clean_dataset = _add_video_length(_clean(train_source))
+        train_dataset, validation_dataset = _split_validation(
+            clean_dataset, validation_size, seed
         )
 
-    if validation_datasets:
-        output["val"] = (
-            validation_datasets[0]
-            if len(validation_datasets) == 1
-            else concatenate_datasets(validation_datasets)
-        )
+        if "train" in splits:
+            output["train"] = _select_fraction(train_dataset, train_fraction, seed)
 
-    if test_datasets:
-        output["test"] = (
-            test_datasets[0]
-            if len(test_datasets) == 1
-            else concatenate_datasets(test_datasets)
+        if "val" in splits:
+            output["val"] = _select_fraction(
+                validation_dataset, validation_fraction, seed
+            )
+
+    if "test" in splits:
+        test_dataset = hf_load_dataset(
+            HF_NAME, split="test", streaming=False, cache_dir=config["HF_DATASETS_CACHE"]
+        )
+        output["test"] = _select_fraction(
+            _add_video_length(_clean(test_dataset)), test_fraction, seed
         )
     return output
-
-
-def load_video(video_source, start_time=0.0, end_time=None):
-    if isinstance(video_source, dict):
-        video_source = video_source.get("bytes") or video_source.get("path")
-
-    decoder = VideoDecoder(video_source, dimension_order="NCHW")
-    end_time = (
-        decoder.metadata.duration_seconds if end_time is None else float(end_time)
-    )
-
-    return decoder.get_frames_played_in_range(float(start_time), end_time).data
-
-
-class ScaleVideo(torch.nn.Module):
-    def forward(self, video):
-        return video.float().div(255.0)
-
-
-class TimeMask(torch.nn.Module):
-    def __init__(self, window=10, stride=25):
-        super().__init__()
-        self.window = window
-        self.stride = stride
-
-    def forward(self, x):
-        output = x.clone()
-        size = output.size(0)
-        count = int((size + self.stride - 0.1) // self.stride)
-        for width in torch.randint(0, self.window, (count,)).tolist():
-            if width <= 0 or width >= size:
-                continue
-            start = random.randrange(0, size - width)
-            output[start : start + width] = 0
-        return output
-
-
-class VideoTransform:
-    def __init__(self, split="train", crop=88):
-        crop_transform = (
-            torchvision.transforms.RandomCrop(crop)
-            if split == "train"
-            else torchvision.transforms.CenterCrop(crop)
-        )
-
-        transforms = [
-            ScaleVideo(),
-            crop_transform,
-            torchvision.transforms.Grayscale(),
-        ]
-
-        if split == "train":
-            transforms.append(TimeMask())
-
-        transforms.append(torchvision.transforms.Normalize(0.421, 0.165))
-        self.pipeline = torch.nn.Sequential(*transforms)
-
-    def __call__(self, video):
-        return self.pipeline(video)
 
 
 @dataclass
 class Collator:
     text_transform: TextTransform
     split: str = "train"
-    crop: int = 88
 
     def __post_init__(self):
-        self.video_transform = VideoTransform(self.split, self.crop)
+        self.video_transform = VideoTransform(self.split)
 
     def __call__(self, items):
         videos = []

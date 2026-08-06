@@ -2,46 +2,35 @@ import argparse
 import os
 
 import torch
+import yaml
 from transformers import TrainingArguments
 
-from srcs.datasets.vicocktail import Collator, DATASETS, load_dataset
+from srcs.datasets.vicocktail import Collator, load_vicocktail
 from srcs.nets.e2e import get_model as create_model
 from srcs.nets.utils import parameter_count
 from srcs.spm.spm_train import ensure_unigram, get_paths
 from srcs.spm.text_transofm import TextTransform
-from srcs.trainer.HF_Trainer import HFTrainer, build_metric_fn
+from srcs.trainer.HF_Trainer import (
+    HFTrainer,
+    build_metric_fn,
+    preprocess_logits_for_metrics,
+)
 
-SEED = 42
-BATCH_SIZE = 4
-NUM_WORKERS = 2
-GRADIENT_ACCUMULATION_STEPS = 2
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 0.005
-WARMUP_RATIO = 0.05
-MAX_GRAD_NORM = 5.0
-LOGGING_STEPS = 25
-SAVE_TOTAL_LIMIT = 3
-FREEZE_FRONTEND = False
-PRETRAINED_WEIGHTS_PATH = None
-RESUME_CHECKPOINT_PATH = None
-MODEL_CONFIG = {
-    "attention_dim": 256,
-    "attention_heads": 4,
-    "linear_units": 1024,
-    "num_blocks": 4,
-    "dropout_rate": 0.1,
-    "attention_dropout_rate": 0.0,
-    "cnn_module_kernel": 31,
-}
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 
 
-def get_model(model_name, text_transform):
+def load_config(path):
+    with open(path, encoding="utf-8") as file:
+        return yaml.safe_load(file)
+
+
+def get_model(args, text_transform, model_config):
     model = create_model(
-        model_name,
+        args.model,
         text_transform.vocab_size,
-        pretrained_weights=PRETRAINED_WEIGHTS_PATH,
-        freeze_frontend=FREEZE_FRONTEND,
-        **MODEL_CONFIG,
+        pretrained_weights=args.pretrained_weights,
+        freeze_frontend=args.freeze_frontend,
+        **model_config,
     )
     print(f"Model parameters: {parameter_count(model):,}")
     print(f"Trainable parameters: {parameter_count(model, True):,}")
@@ -50,48 +39,53 @@ def get_model(model_name, text_transform):
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=CONFIG_PATH)
     parser.add_argument("--model", choices=("e2e",), required=True)
-    parser.add_argument("--dataset", choices=(*DATASETS, "all"), default="all")
+    parser.add_argument("--dataset", choices=("vicocktail",), default="vicocktail")
     parser.add_argument("--output_dir", default="/checkpoints")
     parser.add_argument("--train_fraction", type=float, default=0.2)
     parser.add_argument("--val_fraction", type=float, default=1.0)
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--epochs", type=int, default=75)
+    parser.add_argument("--pretrained_weights")
+    parser.add_argument("--resume_checkpoint")
+    parser.add_argument("--freeze_frontend", action="store_true")
     return parser.parse_args()
 
 
-def get_training_args(args):
+def get_training_args(args, config):
     return TrainingArguments(
         output_dir=args.output_dir,
         logging_dir=os.path.join(args.output_dir, "logs"),
         label_names=["labels", "label_lengths"],
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE,
+        per_device_train_batch_size=config["batch_size"],
+        per_device_eval_batch_size=config["batch_size"],
         num_train_epochs=args.epochs,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        learning_rate=args.lr,
-        weight_decay=WEIGHT_DECAY,
-        warmup_ratio=WARMUP_RATIO,
-        max_grad_norm=MAX_GRAD_NORM,
+        gradient_accumulation_steps=config["gradient_accumulation_steps"],
+        learning_rate=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+        warmup_ratio=config["warmup_ratio"],
+        max_grad_norm=config["max_grad_norm"],
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_strategy="steps",
-        logging_steps=LOGGING_STEPS,
+        logging_steps=config["logging_steps"],
         fp16=torch.cuda.is_available(),
         remove_unused_columns=False,
-        dataloader_num_workers=NUM_WORKERS,
+        dataloader_num_workers=config["num_workers"],
         dataloader_pin_memory=torch.cuda.is_available(),
+        train_sampling_strategy="group_by_length",
+        length_column_name="video_length",
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        save_total_limit=SAVE_TOTAL_LIMIT,
+        save_total_limit=config["save_total_limit"],
         report_to="none",
-        seed=SEED,
-        data_seed=SEED,
+        seed=config["seed"],
+        data_seed=config["seed"],
     )
 
 
-def get_text_transform(dataset_name, train_dataset):
+def get_text_transform(train_dataset):
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     rank = torch.distributed.get_rank() if distributed else 0
     model_path = None
@@ -99,9 +93,9 @@ def get_text_transform(dataset_name, train_dataset):
     if rank == 0:
         model_path, units_path = get_paths()
         if not os.path.isfile(model_path):
-            tokenizer_dataset = load_dataset(
-                dataset_name, train_fraction=1.0, splits=("train",)
-            )["train"]
+            tokenizer_dataset = load_vicocktail(train_fraction=1.0, splits=("train",))[
+                "train"
+            ]
         else:
             tokenizer_dataset = train_dataset
         model_path, units_path = ensure_unigram(tokenizer_dataset)
@@ -114,29 +108,31 @@ def get_text_transform(dataset_name, train_dataset):
 
 def main():
     args = parse_args()
-    torch.manual_seed(SEED)
+    config = load_config(args.config)
+    training_config = config["training"]
+    torch.manual_seed(training_config["seed"])
 
-    dataset_splits = load_dataset(
-        args.dataset,
+    dataset_splits = load_vicocktail(
         train_fraction=args.train_fraction,
         validation_fraction=args.val_fraction,
         test_fraction=1.0,
         splits=("train", "val"),
     )
 
-    text_transform = get_text_transform(args.dataset, dataset_splits["train"])
-    model = get_model(args.model, text_transform)
+    text_transform = get_text_transform(dataset_splits["train"])
+    model = get_model(args, text_transform, config["model"])
 
     trainer = HFTrainer(
         model=model,
-        args=get_training_args(args),
+        args=get_training_args(args, training_config),
         train_dataset=dataset_splits["train"],
         eval_dataset=dataset_splits["val"],
         data_collator=Collator(text_transform, "train"),
         validation_collator=Collator(text_transform, "val"),
         compute_metrics=build_metric_fn(text_transform),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
-    trainer.train(resume_from_checkpoint=RESUME_CHECKPOINT_PATH)
+    trainer.train(resume_from_checkpoint=args.resume_checkpoint)
     trainer.save_model(os.path.join(args.output_dir, "final"))
     trainer.save_state()
 

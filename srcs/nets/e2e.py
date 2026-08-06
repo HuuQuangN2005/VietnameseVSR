@@ -8,8 +8,7 @@ from srcs.nets.backend.ctc import CTC
 from srcs.nets.backend.encoder.conformer_encoder import ConformerEncoder
 from srcs.nets.backend.frontend.resnet import video_resnet
 from srcs.nets.backend.nets_utils import make_non_pad_mask
-from srcs.nets.scorers.ctc import ctc_decode
-from srcs.nets.utils import freeze, load_weights
+from srcs.nets.utils import ctc_decode, freeze, load_weights
 
 
 class VSRConfig(PretrainedConfig):
@@ -76,10 +75,12 @@ class Model(nn.Module):
             blank_id=blank_id,
             ignore_id=ignore_id,
         )
+
         self.vocab_size = vocab_size
         self.blank_id = blank_id
         self.ignore_id = ignore_id
         self.frontend_frozen = False
+
         self.config = VSRConfig(
             vocab_size=vocab_size,
             attention_dim=attention_dim,
@@ -109,30 +110,15 @@ class Model(nn.Module):
         encoded_features = self.encoder(encoded_features, mask)[0]
         return encoded_features, video_lengths
 
-    def forward(
-        self,
-        videos,
-        video_lengths,
-        labels=None,
-        label_lengths=None,
-        **kwargs,
-    ):
+    def forward(self, videos, video_lengths, labels=None, label_lengths=None, **kwargs):
         del kwargs
         encoded_features, input_lengths = self.encode(videos, video_lengths)
-        loss, logits = self.ctc(
-            encoded_features, input_lengths, labels, label_lengths
-        )
-        return {
-            "loss": loss,
-            "logits": logits,
-            "input_lengths": input_lengths,
-        }
+        loss, logits = self.ctc(encoded_features, input_lengths, labels, label_lengths)
+        return {"loss": loss, "logits": logits, "input_lengths": input_lengths}
 
     def decode(self, videos, video_lengths):
         output = self(videos, video_lengths)
-        return ctc_decode(
-            output["logits"], output["input_lengths"], self.blank_id
-        )
+        return ctc_decode(output["logits"], output["input_lengths"], self.blank_id)
 
 
 def get_model(

@@ -17,7 +17,6 @@ datasets==5.0.0
 debugpy==1.8.21
 decorator==5.3.1
 dill==0.4.1
-editdistance==0.8.1
 executing==2.2.1
 filelock==3.29.0
 fonttools==4.63.0
@@ -77,6 +76,7 @@ sympy==1.14.0
 tokenizers==0.22.2
 torch==2.13.0+cu126
 torchcodec==0.15.0+cu126
+torchmetrics==1.9.0
 torchvision==0.28.0+cu126
 tornado==6.5.7
 tqdm==4.69.0

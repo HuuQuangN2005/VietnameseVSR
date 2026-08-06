@@ -39,9 +39,7 @@ def load_weights(model, path, part=None):
         checkpoint = load_file(path, device="cpu")
     else:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    source_state = {
-        _strip(key): value for key, value in _state(checkpoint).items()
-    }
+    source_state = {_strip(key): value for key, value in _state(checkpoint).items()}
     module = getattr(model, part) if part else model
     target_state = module.state_dict()
     loaded = {}
@@ -74,3 +72,24 @@ def parameter_count(model, trainable=False):
     if trainable:
         params = (param for param in params if param.requires_grad)
     return sum(param.numel() for param in params)
+
+
+def ctc_decode(outputs, input_lengths=None, blank_id=0):
+    if outputs.ndim == 3:
+        frame_ids = outputs.argmax(-1)
+    elif outputs.ndim == 2:
+        frame_ids = outputs
+    else:
+        raise ValueError("outputs must have shape (batch, time, vocab) or (batch, time)")
+    if input_lengths is None:
+        input_lengths = torch.full(
+            (frame_ids.size(0),),
+            frame_ids.size(1),
+            dtype=torch.long,
+            device=frame_ids.device,
+        )
+    decoded_tokens = []
+    for token_ids, length in zip(frame_ids, input_lengths.tolist()):
+        token_ids = torch.unique_consecutive(token_ids[: int(length)])
+        decoded_tokens.append(token_ids[token_ids.ne(blank_id)].detach().cpu().tolist())
+    return decoded_tokens
