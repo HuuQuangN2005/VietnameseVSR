@@ -10,6 +10,7 @@
 
 import copy
 import torch
+
 from srcs.nets.backend.nets_utils import rename_state_dict
 from srcs.nets.backend.transformer.attention import RelPositionMultiHeadedAttention
 from srcs.nets.backend.transformer.embedding import RelPositionalEncoding
@@ -43,6 +44,7 @@ class ConvolutionModule(torch.nn.Module):
         x = torch.nn.functional.glu(self.pointwise_cov1(x), dim=1)
         x = self.activation(self.norm(self.depthwise_conv(x)))
         x = self.pointwise_cov2(x)
+
         return x.transpose(1, 2)
 
 
@@ -89,18 +91,22 @@ class EncoderLayer(torch.nn.Module):
         self.macaron_style = macaron_style
         self.norm_ff = LayerNorm(size)  # for the FNN module
         self.norm_mha = LayerNorm(size)  # for the MHA module
+
         if self.macaron_style:
             self.feed_forward_macaron = copy.deepcopy(feed_forward)
             self.ff_scale = 0.5
             # for another FNN module in macaron style
             self.norm_ff_macaron = LayerNorm(size)
+
         if self.conv_module is not None:
             self.norm_conv = LayerNorm(size)  # for the CNN module
             self.norm_final = LayerNorm(size)  # for the final output of the block
+
         self.dropout = torch.nn.Dropout(dropout_rate)
         self.size = size
         self.normalize_before = normalize_before
         self.concat_after = concat_after
+
         if self.concat_after:
             self.concat_linear = torch.nn.Linear(size + size, size)
 
@@ -120,14 +126,18 @@ class EncoderLayer(torch.nn.Module):
         # whether to use macaron style
         if self.macaron_style:
             residual = x
+
             if self.normalize_before:
                 x = self.norm_ff_macaron(x)
+
             x = residual + self.ff_scale * self.dropout(self.feed_forward_macaron(x))
+
             if not self.normalize_before:
                 x = self.norm_ff_macaron(x)
 
         # multi-headed self-attention module
         residual = x
+
         if self.normalize_before:
             x = self.norm_mha(x)
 
@@ -149,23 +159,30 @@ class EncoderLayer(torch.nn.Module):
             x = residual + self.concat_linear(x_concat)
         else:
             x = residual + self.dropout(x_att)
+
         if not self.normalize_before:
             x = self.norm_mha(x)
 
         # convolution module
         if self.conv_module is not None:
             residual = x
+
             if self.normalize_before:
                 x = self.norm_conv(x)
+
             x = residual + self.dropout(self.conv_module(x))
+
             if not self.normalize_before:
                 x = self.norm_conv(x)
 
         # feed forward module
         residual = x
+
         if self.normalize_before:
             x = self.norm_ff(x)
+
         x = residual + self.ff_scale * self.dropout(self.feed_forward(x))
+
         if not self.normalize_before:
             x = self.norm_ff(x)
 
@@ -270,6 +287,7 @@ class ConformerEncoder(torch.nn.Module):
             ),
             layer_drop_rate=layer_drop_rate,
         )
+
         if self.normalize_before:
             self.after_norm = LayerNorm(attention_dim)
 
@@ -292,26 +310,3 @@ class ConformerEncoder(torch.nn.Module):
             xs = self.after_norm(xs)
 
         return xs, masks
-
-    def forward_one_step(self, xs, masks, cache=None):
-        """Encode input frame.
-
-        :param torch.Tensor xs: input tensor
-        :param torch.Tensor masks: input mask
-        :param List[torch.Tensor] cache: cache tensors
-        :return: position embedded tensor, mask and new cache
-        :rtype Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
-        """
-        xs = self.embed(xs)
-
-        if cache is None:
-            cache = [None for _ in range(len(self.encoders))]
-        new_cache = []
-        for c, e in zip(cache, self.encoders):
-            xs, masks = e(xs, masks, cache=c)
-            new_cache.append(xs[0] if isinstance(xs, tuple) else xs)
-        if isinstance(xs, tuple):
-            xs = xs[0]
-        if self.normalize_before:
-            xs = self.after_norm(xs)
-        return xs, masks, new_cache

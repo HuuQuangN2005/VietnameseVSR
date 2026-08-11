@@ -24,10 +24,16 @@ class CTC(torch.nn.Module):
         )
 
     def forward(self, encoded_features, input_lengths, labels=None, label_lengths=None):
+        # encoded_features: [B, T, D], input_lengths: [B]
         logits = self.ctc_lo(self.dropout(encoded_features))
+        # logits: [B, T, V]
         if labels is None:
             return None, logits
 
+        loss = self.loss_from_logits(logits, input_lengths, labels, label_lengths)
+        return loss, logits
+
+    def loss_from_logits(self, logits, input_lengths, labels, label_lengths=None):
         labels = labels.to(logits.device, dtype=torch.long)
         input_lengths = input_lengths.to(logits.device, dtype=torch.long)
 
@@ -39,20 +45,15 @@ class CTC(torch.nn.Module):
             positions = torch.arange(labels.size(1), device=logits.device)
             label_mask = positions.unsqueeze(0) < label_lengths.unsqueeze(1)
 
+        # label_mask: [B, L], label_lengths: [B]
         targets = labels.masked_select(label_mask)
+        # targets: [sum(label_lengths)]
         log_probs = logits.log_softmax(dim=-1).transpose(0, 1)
+        # log_probs: [T, B, V]
         loss = self.ctc_loss(log_probs, targets, input_lengths, label_lengths)
 
         if self.reduce:
             loss = loss / logits.size(0)
 
-        return loss, logits
-
-    def softmax(self, encoded_features):
-        return torch.softmax(self.ctc_lo(encoded_features), dim=-1)
-
-    def log_softmax(self, encoded_features):
-        return torch.log_softmax(self.ctc_lo(encoded_features), dim=-1)
-
-    def argmax(self, encoded_features):
-        return self.ctc_lo(encoded_features).argmax(dim=-1)
+        # loss: scalar when reduce is enabled, otherwise [B]
+        return loss

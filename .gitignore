@@ -2,9 +2,10 @@
 data/HF_dataset/
 data/vicocktail/
 papers/
+plans.docx
 
 
-
+checkpoints/*
 data/.hf
 data/Vicocktail/
 

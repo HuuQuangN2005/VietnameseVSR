@@ -48,12 +48,15 @@ class BasicBlock(nn.Module):
         if relu_type == "relu":
             self.relu1 = nn.ReLU(inplace=True)
             self.relu2 = nn.ReLU(inplace=True)
+
         elif relu_type == "prelu":
             self.relu1 = nn.PReLU(num_parameters=planes)
             self.relu2 = nn.PReLU(num_parameters=planes)
+
         elif relu_type == "swish":
             self.relu1 = nn.SiLU(inplace=True)
             self.relu2 = nn.SiLU(inplace=True)
+
         else:
             raise NotImplementedError
         # --------
@@ -74,6 +77,7 @@ class BasicBlock(nn.Module):
         out = self.relu1(out)
         out = self.conv2(out)
         out = self.bn2(out)
+
         if self.downsample is not None:
             residual = self.downsample(x)
 
@@ -104,6 +108,7 @@ class ResNet(nn.Module):
         :param stride: int, size of the convolving kernel.
         """
         downsample = None
+
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = self.downsample_block(
                 inplanes=self.inplanes, outplanes=planes * block.expansion, stride=stride
@@ -114,6 +119,7 @@ class ResNet(nn.Module):
             block(self.inplanes, planes, stride, downsample, relu_type=self.relu_type)
         )
         self.inplanes = planes * block.expansion
+
         for _ in range(1, blocks):
             layers.append(block(self.inplanes, planes, relu_type=self.relu_type))
 
@@ -129,6 +135,7 @@ class ResNet(nn.Module):
         x = self.layer4(x)
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
+
         return x
 
 
@@ -136,6 +143,7 @@ class ResNet(nn.Module):
 def threeD_to_2D_tensor(x):
     n_batch, n_channels, s_time, sx, sy = x.shape
     x = x.transpose(1, 2)
+
     return x.reshape(n_batch * s_time, n_channels, sx, sy)
 
 
@@ -184,10 +192,14 @@ class Conv3dResNet(nn.Module):
         xs_pad = xs_pad.transpose(2, 1)
         B, C, T, H, W = xs_pad.size()
         xs_pad = self.frontend3D(xs_pad)
-        Tnew = xs_pad.shape[2]  # outpu should be B x C2 x Tnew x H x W
+
+        Tnew = xs_pad.shape[2]  # output should be B x C2 x Tnew x H x W
+
         xs_pad = threeD_to_2D_tensor(xs_pad)
+
         xs_pad = self.trunk(xs_pad)
         xs_pad = xs_pad.view(B, Tnew, xs_pad.size(1))
+
         return xs_pad
 
 

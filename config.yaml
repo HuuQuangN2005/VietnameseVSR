@@ -2,14 +2,21 @@ model:
   attention_dim: 256
   attention_heads: 4
   linear_units: 1024
-  num_blocks: 4
+  num_blocks: 8
   dropout_rate: 0.1
   attention_dropout_rate: 0.0
   cnn_module_kernel: 31
 
+refiner:
+  visual_dim: 512
+  attn_dim: 256
+  num_heads: 4
+  dropout: 0.1
+  temperature: 2.0
+
 training:
   seed: 42
-  batch_size: 2
+  batch_size: 12
   num_workers: 4
   gradient_accumulation_steps: 2
   learning_rate: 0.0001
@@ -18,7 +25,9 @@ training:
   max_grad_norm: 5.0
   logging_steps: 25
   save_total_limit: 3
+  early_stopping_patience: 5
+  early_stopping_threshold: 0.001
 
 evaluation:
-  batch_size: 2
-  num_workers: 2
+  batch_size: 12
+  num_workers: 4
