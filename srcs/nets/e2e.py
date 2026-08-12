@@ -4,11 +4,11 @@
 import torch
 import torch.nn as nn
 
-from srcs.nets.backend.ctc import CTC
+from srcs.nets.backend.ctc import CTC, WERGuidedCTCLoss
 from srcs.nets.backend.encoder.conformer_encoder import ConformerEncoder
 from srcs.nets.backend.frontend.resnet import video_resnet
 from srcs.nets.backend.nets_utils import make_non_pad_mask
-from srcs.nets.backend.refiner import TemperedVisualCTCRefiner
+from srcs.nets.backend.refiner.refiner import VisualEvidenceCTCRefiner
 from srcs.nets.utils import ctc_decode, freeze, load_weights
 
 
@@ -71,23 +71,24 @@ class VSRModel(nn.Module):
         mask = (
             make_non_pad_mask(video_lengths).to(videos.device).unsqueeze(-2)
         )  # [B, 1, T]
-        visual_feats = self.frontend(videos)
-        encoded_features = self.proj_encoder(visual_feats)  # [B, T, D]
-        encoded_features = self.encoder(encoded_features, mask)[0]  # [B, T, D]
+        visual_features = self.frontend(videos)
+        visual_features = self.proj_encoder(visual_features)  # [B, T, D]
+        encoded_features = self.encoder(visual_features, mask)[0]  # [B, T, D]
 
         if return_visual:
-            return encoded_features, video_lengths, visual_feats
+            return encoded_features, video_lengths, visual_features
 
         return encoded_features, video_lengths
 
     def get_contexts(self, videos, video_lengths):
-        encoded_features, input_lengths, visual_feats = self.encode(
+        encoded_features, input_lengths, _ = self.encode(
             videos, video_lengths, return_visual=True
         )
         _, logits = self.ctc(encoded_features, input_lengths)
 
         return {
-            "visual_feats": visual_feats,
+            "visual_features": encoded_features,
+            "encoded_features": encoded_features,
             "logits": logits,
             "input_lengths": input_lengths,
         }
@@ -113,24 +114,40 @@ class VisualRefinerVSRModel(nn.Module):
     def __init__(
         self,
         vsr_model,
-        visual_dim=512,
-        attn_dim=256,
+        d_model=256,
         num_heads=4,
-        dropout=0.1,
-        temperature=2.0,
+        ffn_dim=1024,
+        num_blocks=1,
+        dropout_rate=0.1,
+        positional_dropout_rate=0.1,
+        attention_dropout_rate=0.0,
+        corruption_rate=0.1,
+        corruption_sample_probability=0.5,
+        top1_suppression=0.25,
+        wer_weight=1.0,
+        text_transform=None,
         checkpoint_dir=None,
         freeze_baseline=True,
     ):
         super().__init__()
         self.vsr_model = vsr_model
-        self.refiner = TemperedVisualCTCRefiner(
+        self.refiner = VisualEvidenceCTCRefiner(
             vocab_size=vsr_model.vocab_size,
-            visual_dim=visual_dim,
-            attn_dim=attn_dim,
+            d_model=d_model,
             num_heads=num_heads,
-            dropout=dropout,
-            temperature=temperature,
+            ffn_dim=ffn_dim,
+            num_blocks=num_blocks,
+            dropout_rate=dropout_rate,
+            positional_dropout_rate=positional_dropout_rate,
+            attention_dropout_rate=attention_dropout_rate,
+            corruption_rate=corruption_rate,
+            corruption_sample_probability=corruption_sample_probability,
+            top1_suppression=top1_suppression,
         )
+        if text_transform is None:
+            raise ValueError("text_transform is required for WER-guided CTC loss.")
+
+        self.loss_fn = WERGuidedCTCLoss(text_transform, wer_weight)
         self.blank_id = vsr_model.blank_id
         self.freeze_baseline = freeze_baseline
 
@@ -165,26 +182,33 @@ class VisualRefinerVSRModel(nn.Module):
         else:
             contexts = self.vsr_model.get_contexts(videos, video_lengths)
 
-        visual_feats = contexts["visual_feats"]
-        input_lengths = contexts["input_lengths"]
-
-        positions = torch.arange(visual_feats.size(1), device=visual_feats.device)
-        padding_mask = positions.unsqueeze(0) >= input_lengths.to(
-            visual_feats.device
-        ).unsqueeze(1)
-
         refined = self.refiner(
-            contexts["logits"], visual_feats, padding_mask=padding_mask
+            logits=contexts["logits"],
+            visual_features=contexts["visual_features"],
+            input_lengths=contexts["input_lengths"],
         )
-
         loss = None
+        raw_ctc_loss = None
 
         if labels is not None:
-            loss = self.vsr_model.ctc.loss_from_logits(
-                refined["logits"], input_lengths, labels, label_lengths
+            loss_output = self.loss_fn(
+                self.vsr_model.ctc,
+                refined["logits"],
+                contexts["input_lengths"],
+                labels,
+                label_lengths,
             )
+            loss = loss_output["loss"]
+            raw_ctc_loss = loss_output["raw_ctc_loss"]
 
-        return {"loss": loss, "logits": refined["logits"], "input_lengths": input_lengths}
+        return {
+            "loss": loss,
+            "logits": refined["logits"],
+            "input_lengths": contexts["input_lengths"],
+            "first_logits": contexts["logits"],
+            "raw_ctc_loss": raw_ctc_loss,
+            "refined_flip_rate": refined["refined_flip_rate"],
+        }
 
     def decode(self, videos, video_lengths):
         output = self(videos, video_lengths)

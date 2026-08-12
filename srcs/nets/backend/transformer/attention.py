@@ -69,7 +69,6 @@ class MultiHeadedAttention(nn.Module):
                 weighted by the attention score (#batch, time1, time2).
         """
         n_batch = value.size(0)
-
         if mask is not None:
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
             min_value = torch.finfo(scores.dtype).min
@@ -85,10 +84,8 @@ class MultiHeadedAttention(nn.Module):
         x = (
             x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)
         )  # (batch, time1, d_model)
-
         if rtn_attn:
             return self.linear_out(x), self.attn
-
         return self.linear_out(x)  # (batch, time1, d_model)
 
     def forward(self, query, key, value, mask, rtn_attn=False):

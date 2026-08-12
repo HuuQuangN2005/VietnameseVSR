@@ -50,6 +50,7 @@ def get_model(args, text_transform, model_config, refiner_config):
         )
         model = VisualRefinerVSRModel(
             baseline,
+            text_transform=text_transform,
             checkpoint_dir=args.checkpoint_dir,
             freeze_baseline=args.freeze_baseline,
             **refiner_config,
@@ -108,7 +109,9 @@ def get_training_args(args, config):
         train_sampling_strategy="group_by_length",
         length_column_name="video_length",
         load_best_model_at_end=True,
-        metric_for_best_model="eval_wer",
+        metric_for_best_model=(
+            "eval_refined_wer" if args.model == "refiner" else "eval_wer"
+        ),
         greater_is_better=False,
         save_total_limit=config["save_total_limit"],
         seed=config["seed"],

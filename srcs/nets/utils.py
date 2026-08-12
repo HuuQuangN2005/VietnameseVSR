@@ -112,10 +112,12 @@ def ctc_decode(outputs, input_lengths=None, blank_id=0):
             device=frame_ids.device,
         )
 
+    frame_ids = frame_ids.detach().cpu()
+    input_lengths = input_lengths.detach().cpu()
     decoded_tokens = []
 
     for token_ids, length in zip(frame_ids, input_lengths.tolist()):
         token_ids = torch.unique_consecutive(token_ids[: int(length)])
-        decoded_tokens.append(token_ids[token_ids.ne(blank_id)].detach().cpu().tolist())
+        decoded_tokens.append(token_ids[token_ids.ne(blank_id)].tolist())
 
     return decoded_tokens

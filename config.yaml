@@ -8,11 +8,17 @@ model:
   cnn_module_kernel: 31
 
 refiner:
-  visual_dim: 512
-  attn_dim: 256
+  d_model: 256
   num_heads: 4
-  dropout: 0.1
-  temperature: 2.0
+  ffn_dim: 1024
+  num_blocks: 1
+  dropout_rate: 0.1
+  positional_dropout_rate: 0.1
+  attention_dropout_rate: 0.0
+  corruption_rate: 0.1
+  corruption_sample_probability: 0.5
+  top1_suppression: 0.25
+  wer_weight: 1.0
 
 training:
   seed: 42
