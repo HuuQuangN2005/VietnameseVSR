@@ -6,12 +6,23 @@ import yaml
 from transformers import EarlyStoppingCallback, TrainingArguments
 from srcs.datasets.vicocktail import Collator, load_vicocktail
 from srcs.nets.e2e import VisualRefinerVSRModel, get_model as create_model
-from srcs.nets.utils import parameter_count
+from srcs.nets.lora import (
+    apply_lora,
+    print_trainable_parameters,
+    trainable_parameter_names,
+)
+from srcs.nets.utils import load_backbone_weights, load_weights, parameter_count
 from srcs.spm.spm_train import ensure_unigram
 from srcs.spm.text_transofm import TextTransform
 from srcs.trainer.trainer import HFTrainer, build_metric_fn, preprocess_logits_for_metrics
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+PRETRAINED_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "checkpoints",
+    "pretrain",
+    "vsr_trlrs3_base.pth",
+)
 
 
 def load_config(path):
@@ -19,16 +30,45 @@ def load_config(path):
         return yaml.safe_load(file)
 
 
-def get_model(args, text_transform, model_config, refiner_config):
-    if args.model == "baseline":
+def get_model(args, text_transform, config):
+    pretrained_path = args.pretrained_weights or args.autoavsr_checkpoint
+
+    if args.model in ("baseline", "teacher"):
         model = create_model(
-            "baseline",
+            args.model,
             text_transform.vocab_size,
-            pretrained_weights=args.pretrained_weights,
-            checkpoint_path=args.checkpoint_dir or args.baseline_checkpoint,
-            freeze_frontend=args.freeze_frontend,
-            **model_config,
+            **config[args.model],
         )
+        report = load_backbone_weights(model, pretrained_path)
+        print(
+            f"Loaded Auto-AVSR backbone: {len(report['loaded'])} tensors; "
+            f"skipped: {len(report['skipped'])}."
+        )
+
+        if args.model == "teacher":
+            lora_config = config["lora"]
+
+            if not lora_config["enabled"]:
+                raise ValueError("LoRA must be enabled when training the teacher.")
+
+            replaced = apply_lora(
+                model=model,
+                start_block=lora_config["start_block"],
+                rank=lora_config["rank"],
+                alpha=lora_config["alpha"],
+                dropout_rate=lora_config["dropout_rate"],
+                target_modules=tuple(lora_config["target_modules"]),
+            )
+            print(f"Applied LoRA to {len(replaced)} linear modules.")
+
+        checkpoint_path = args.checkpoint_dir or args.baseline_checkpoint
+
+        if checkpoint_path:
+            load_weights(model, checkpoint_path)
+
+        if args.freeze_frontend:
+            model.freeze_frontend()
+
     else:
         if (
             args.freeze_baseline
@@ -43,21 +83,28 @@ def get_model(args, text_transform, model_config, refiner_config):
         baseline = create_model(
             "baseline",
             text_transform.vocab_size,
-            pretrained_weights=args.pretrained_weights,
-            checkpoint_path=args.baseline_checkpoint,
-            freeze_frontend=args.freeze_frontend,
-            **model_config,
-        )
-        model = VisualRefinerVSRModel(
-            baseline,
-            text_transform=text_transform,
-            checkpoint_dir=args.checkpoint_dir,
-            freeze_baseline=args.freeze_baseline,
-            **refiner_config,
+            **config["baseline"],
         )
 
-    print(f"Model parameters: {parameter_count(model):,}")
-    print(f"Trainable parameters: {parameter_count(model, True):,}")
+        if args.baseline_checkpoint:
+            load_weights(baseline, args.baseline_checkpoint)
+        else:
+            report = load_backbone_weights(baseline, pretrained_path)
+            print(f"Loaded Auto-AVSR baseline backbone: {len(report['loaded'])} tensors.")
+
+        model = VisualRefinerVSRModel(
+            baseline,
+            checkpoint_dir=args.checkpoint_dir,
+            freeze_baseline=args.freeze_baseline,
+            **config["refiner"],
+        )
+
+    if args.model == "teacher":
+        print_trainable_parameters(model)
+        print(f"Trainable tensors: {len(trainable_parameter_names(model))}")
+    else:
+        print(f"Model parameters: {parameter_count(model):,}")
+        print(f"Trainable parameters: {parameter_count(model, True):,}")
 
     return model
 
@@ -65,13 +112,16 @@ def get_model(args, text_transform, model_config, refiner_config):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=CONFIG_PATH)
-    parser.add_argument("--model", choices=("baseline", "refiner"), required=True)
+    parser.add_argument(
+        "--model", choices=("baseline", "teacher", "refiner"), required=True
+    )
     parser.add_argument("--dataset", choices=("vicocktail",), default="vicocktail")
     parser.add_argument("--output_dir", default="/checkpoints")
     parser.add_argument("--train_fraction", type=float, default=1.0)
     parser.add_argument("--val_fraction", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--pretrained_weights")
+    parser.add_argument("--autoavsr_checkpoint", default=PRETRAINED_PATH)
     parser.add_argument("--baseline_checkpoint")
     parser.add_argument("--checkpoint_dir")
     parser.add_argument("--resume_checkpoint")
@@ -152,17 +202,23 @@ def main():
     )
 
     text_transform = get_text_transform(dataset_splits["train"])
-    model = get_model(args, text_transform, config["model"], config.get("refiner", {}))
+    model = get_model(args, text_transform, config)
+
+    allowed_trainable_names = None
+
+    if args.model == "teacher":
+        allowed_trainable_names = ("ctc.", ".lora_a.", ".lora_b.")
 
     trainer = HFTrainer(
         model=model,
         args=get_training_args(args, training_config),
         train_dataset=dataset_splits["train"],
         eval_dataset=dataset_splits["val"],
-        data_collator=Collator(text_transform, "train"),
+        train_collator=Collator(text_transform, "train"),
         validation_collator=Collator(text_transform, "val"),
         compute_metrics=build_metric_fn(text_transform),
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        allowed_trainable_names=allowed_trainable_names,
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=training_config["early_stopping_patience"],

@@ -1,24 +1,38 @@
-model:
-  attention_dim: 256
-  attention_heads: 4
-  linear_units: 1024
-  num_blocks: 8
+teacher:
+  attention_dim: 768
+  attention_heads: 12
+  linear_units: 3072
+  num_blocks: 12
+  dropout_rate: 0.1
+  attention_dropout_rate: 0.0
+  cnn_module_kernel: 31
+
+baseline:
+  attention_dim: 768
+  attention_heads: 12
+  linear_units: 3072
+  num_blocks: 6
   dropout_rate: 0.1
   attention_dropout_rate: 0.0
   cnn_module_kernel: 31
 
 refiner:
-  d_model: 256
-  num_heads: 4
-  ffn_dim: 1024
+  attention_dim: 512
+  attention_heads: 8
+  linear_units: 2048
   num_blocks: 1
   dropout_rate: 0.1
-  positional_dropout_rate: 0.1
   attention_dropout_rate: 0.0
-  corruption_rate: 0.1
-  corruption_sample_probability: 0.5
-  top1_suppression: 0.25
-  frame_weight: 1.0
+
+lora:
+  enabled: true
+  start_block: 8
+  rank: 8
+  alpha: 16
+  dropout_rate: 0.05
+  target_modules:
+    - linear_q
+    - linear_v
 
 training:
   seed: 42

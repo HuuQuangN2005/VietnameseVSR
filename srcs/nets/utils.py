@@ -79,6 +79,56 @@ def load_weights(model, path, part=None):
     }
 
 
+def load_backbone_weights(model, path):
+    path = _weight_path(path)
+
+    if path.endswith(".safetensors"):
+        checkpoint = load_file(path, device="cpu")
+    else:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+
+    source_state = {_strip(key): value for key, value in _state(checkpoint).items()}
+    target_state = model.state_dict()
+    prefixes = ("frontend.", "proj_encoder.", "encoder.")
+    loaded = {}
+    skipped = []
+    shape_mismatch = []
+
+    for key, value in source_state.items():
+        if not key.startswith(prefixes):
+            skipped.append(key)
+        elif key not in target_state:
+            skipped.append(key)
+        elif target_state[key].shape != value.shape:
+            shape_mismatch.append(
+                {
+                    "key": key,
+                    "source": tuple(value.shape),
+                    "target": tuple(target_state[key].shape),
+                }
+            )
+        else:
+            loaded[key] = value
+
+    backbone_keys = [key for key in target_state if key.startswith(prefixes)]
+    missing = [key for key in backbone_keys if key not in loaded]
+
+    if missing or shape_mismatch:
+        raise RuntimeError(
+            "Auto-AVSR backbone is incompatible: "
+            f"{len(missing)} missing and {len(shape_mismatch)} shape mismatches."
+        )
+
+    model.load_state_dict(loaded, strict=False)
+
+    return {
+        "loaded": list(loaded),
+        "missing": missing,
+        "shape_mismatch": shape_mismatch,
+        "skipped": skipped,
+    }
+
+
 def freeze(module):
     for param in module.parameters():
         param.requires_grad = False

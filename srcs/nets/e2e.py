@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 
-from srcs.nets.backend.ctc import CTC, CTCFrameCorrectionLoss
+from srcs.nets.backend.ctc import CTC
 from srcs.nets.backend.encoder.conformer_encoder import ConformerEncoder
 from srcs.nets.backend.frontend.resnet import video_resnet
 from srcs.nets.backend.nets_utils import make_non_pad_mask
@@ -12,7 +12,7 @@ from srcs.nets.backend.refiner.refiner import VisualEvidenceCTCRefiner
 from srcs.nets.utils import ctc_decode, freeze, load_weights
 
 
-class VSRModel(nn.Module):
+class CustomAutoVSRModel(nn.Module):
     def __init__(
         self,
         vocab_size,
@@ -42,17 +42,17 @@ class VSRModel(nn.Module):
         )
 
         self.ctc = CTC(
-            vocab_size,
-            attention_dim,
-            dropout_rate,
+            output_size=vocab_size,
+            input_size=attention_dim,
+            dropout_rate=dropout_rate,
             blank_id=blank_id,
             ignore_id=ignore_id,
         )
 
         self.vocab_size = vocab_size
         self.blank_id = blank_id
-        self.ignore_id = ignore_id
         self.frontend_frozen = False
+        self.lora_finetuning = False
 
     def freeze_frontend(self):
         freeze(self.frontend)
@@ -64,69 +64,67 @@ class VSRModel(nn.Module):
         if self.frontend_frozen:
             self.frontend.eval()
 
+        if self.lora_finetuning:
+            self.frontend.eval()
+            self.proj_encoder.eval()
+            self.encoder.eval()
+            self.ctc.train(mode)
+
+            for module in self.encoder.modules():
+                if getattr(module, "is_lora", False):
+                    module.train(mode)
+
         return self
 
     def encode(self, videos, video_lengths, return_visual=False):
         # videos: [B, T, 1, H, W], video_lengths: [B]
-        mask = (
+        input_mask = (
             make_non_pad_mask(video_lengths).to(videos.device).unsqueeze(-2)
         )  # [B, 1, T]
         visual_features = self.frontend(videos)
-        visual_features = self.proj_encoder(visual_features)  # [B, T, D]
-        encoded_features = self.encoder(visual_features, mask)[0]  # [B, T, D]
+        encoder_inputs = self.proj_encoder(visual_features)  # [B, T, D]
+        encoder_features = self.encoder(encoder_inputs, input_mask)[0]  # [B, T, D]
 
         if return_visual:
-            return encoded_features, video_lengths, visual_features
+            return encoder_features, video_lengths, visual_features
 
-        return encoded_features, video_lengths
+        return encoder_features, video_lengths
 
     def get_contexts(self, videos, video_lengths):
-        encoded_features, input_lengths, visual_features = self.encode(
+        encoder_features, input_lengths, visual_features = self.encode(
             videos, video_lengths, return_visual=True
         )
-        _, logits = self.ctc(encoded_features, input_lengths)
+        _, logits = self.ctc(encoder_features, input_lengths)
 
         return {
             "visual_features": visual_features,
-            "encoded_features": encoded_features,
+            "encoder_features": encoder_features,
             "logits": logits,
             "input_lengths": input_lengths,
         }
 
     def forward(self, videos, video_lengths, labels=None, label_lengths=None):
-        encoded_features, input_lengths = self.encode(videos, video_lengths)
+        encoder_features, input_lengths = self.encode(videos, video_lengths)
 
-        loss, logits = self.ctc(encoded_features, input_lengths, labels, label_lengths)
+        loss, logits = self.ctc(encoder_features, input_lengths, labels, label_lengths)
 
-        return {
-            "loss": loss,
-            "logits": logits,
-            "input_lengths": input_lengths,
-        }  # loss: scalar, logits: [B, T, V], input_lengths: [B]
+        return {"loss": loss, "logits": logits, "input_lengths": input_lengths}
 
     def decode(self, videos, video_lengths):
         output = self(videos, video_lengths)
-        return ctc_decode(
-            output["logits"], output["input_lengths"], self.blank_id
-        )  # [B, T]
+        return ctc_decode(output["logits"], output["input_lengths"], self.blank_id)
 
 
 class VisualRefinerVSRModel(nn.Module):
     def __init__(
         self,
         vsr_model,
-        d_model=256,
-        num_heads=4,
-        ffn_dim=1024,
+        attention_dim=256,
+        attention_heads=4,
+        linear_units=1024,
         num_blocks=1,
         dropout_rate=0.1,
-        positional_dropout_rate=0.1,
         attention_dropout_rate=0.0,
-        corruption_rate=0.1,
-        corruption_sample_probability=0.5,
-        top1_suppression=0.25,
-        frame_weight=1.0,
-        text_transform=None,
         checkpoint_dir=None,
         freeze_baseline=True,
     ):
@@ -135,18 +133,13 @@ class VisualRefinerVSRModel(nn.Module):
 
         self.refiner = VisualEvidenceCTCRefiner(
             vocab_size=vsr_model.vocab_size,
-            d_model=d_model,
-            num_heads=num_heads,
-            ffn_dim=ffn_dim,
+            attention_dim=attention_dim,
+            attention_heads=attention_heads,
+            linear_units=linear_units,
             num_blocks=num_blocks,
             dropout_rate=dropout_rate,
-            positional_dropout_rate=positional_dropout_rate,
             attention_dropout_rate=attention_dropout_rate,
-            corruption_rate=corruption_rate,
-            corruption_sample_probability=corruption_sample_probability,
-            top1_suppression=top1_suppression,
         )
-        self.loss_fn = CTCFrameCorrectionLoss(frame_weight=frame_weight)
         self.blank_id = vsr_model.blank_id
         self.freeze_baseline = freeze_baseline
 
@@ -181,36 +174,24 @@ class VisualRefinerVSRModel(nn.Module):
         else:
             contexts = self.vsr_model.get_contexts(videos, video_lengths)
 
-        refined = self.refiner(
+        refiner_output = self.refiner(
             logits=contexts["logits"],
             visual_features=contexts["visual_features"],
             input_lengths=contexts["input_lengths"],
         )
         loss = None
-        ctc_loss = None
-        frame_loss = None
 
         if labels is not None:
-            loss_output = self.loss_fn(
-                self.vsr_model.ctc,
-                contexts["logits"],
-                refined["logits"],
-                contexts["input_lengths"],
-                labels,
-                label_lengths,
+            loss = self.vsr_model.ctc.loss_from_logits(
+                refiner_output["logits"], contexts["input_lengths"], labels, label_lengths
             )
-            loss = loss_output["loss"]
-            ctc_loss = loss_output["ctc_loss"]
-            frame_loss = loss_output["frame_loss"]
 
         return {
             "loss": loss,
-            "logits": refined["logits"],
+            "logits": refiner_output["logits"],
             "input_lengths": contexts["input_lengths"],
             "first_logits": contexts["logits"],
-            "ctc_loss": ctc_loss,
-            "frame_loss": frame_loss,
-            "refined_flip_rate": refined["refined_flip_rate"],
+            "refined_flip_rate": refiner_output["refined_flip_rate"],
         }
 
     def decode(self, videos, video_lengths):
@@ -226,13 +207,10 @@ def get_model(
     freeze_frontend=False,
     **model_config,
 ):
-    valid_models = ["baseline"]
-
-    if model_name not in valid_models:
+    if model_name not in ("baseline", "teacher"):
         raise ValueError(f"Unsupported model: {model_name}")
 
-    if model_name == "baseline":
-        model = VSRModel(vocab_size, **model_config)
+    model = CustomAutoVSRModel(vocab_size=vocab_size, **model_config)
 
     if pretrained_weights:
         load_weights(model, pretrained_weights, "frontend")

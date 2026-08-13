@@ -2,15 +2,12 @@
 # License: CC BY-NC 4.0 (https://github.com/nguyenvulebinh/AVSRCocktail/blob/main/LICENSE)
 
 from contextlib import contextmanager
-import time
 
 import numpy as np
 import torch
-from torch.utils.data import SequentialSampler
 from torchmetrics.text import WordErrorRate
 
 from transformers import Trainer, TrainingArguments
-from transformers.trainer_pt_utils import LengthGroupedSampler
 
 from srcs.nets.utils import ctc_decode
 
@@ -27,6 +24,7 @@ class HFTrainer(Trainer):
         compute_metrics=None,
         preprocess_logits_for_metrics=None,
         callbacks=None,
+        allowed_trainable_names=None,
     ):
         if validation_collator is None:
             raise ValueError("validation_collator must be provided.")
@@ -38,15 +36,16 @@ class HFTrainer(Trainer):
             eval_dataset=eval_dataset,
             data_collator=train_collator,
             compute_metrics=compute_metrics,
-            preprocess_logits_for_metrics=(preprocess_logits_for_metrics),
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
             callbacks=callbacks,
         )
 
         if self.args.remove_unused_columns:
             raise ValueError("remove_unused_columns must be False.")
 
-        self.train_collator = train_collator
         self.validation_collator = validation_collator
+        self.allowed_trainable_names = allowed_trainable_names
+        self._validate_trainable_parameters()
 
         self.diagnostic_totals = {
             "train": self._new_diagnostics(),
@@ -55,13 +54,31 @@ class HFTrainer(Trainer):
 
     @staticmethod
     def _new_diagnostics():
-        return {
-            "ctc_loss_sum": 0.0,
-            "frame_loss_sum": 0.0,
-            "sample_count": 0,
-            "flip_count": 0.0,
-            "frame_count": 0,
-        }
+        return {"flip_count": 0.0, "frame_count": 0}
+
+    def _validate_trainable_parameters(self):
+        trainable_names = [
+            name
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        ]
+
+        if not trainable_names:
+            raise ValueError("The model has no trainable parameters.")
+
+        if self.allowed_trainable_names is None:
+            return
+
+        unexpected = [
+            name
+            for name in trainable_names
+            if not any(pattern in name for pattern in self.allowed_trainable_names)
+        ]
+
+        if unexpected:
+            raise ValueError(
+                "Unexpected trainable parameters: " + ", ".join(unexpected[:10])
+            )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         loss, outputs = super().compute_loss(
@@ -89,24 +106,8 @@ class HFTrainer(Trainer):
         return loss
 
     def _update_diagnostics(self, outputs, mode):
-        ctc_loss = outputs.get("ctc_loss")
-        frame_loss = outputs.get("frame_loss")
         refined_flip_rate = outputs.get("refined_flip_rate")
-        logits = outputs.get("logits")
         input_lengths = outputs.get("input_lengths")
-
-        if ctc_loss is None or frame_loss is None:
-            return
-
-        if logits is None:
-            raise RuntimeError("Model output must contain logits.")
-
-        batch_size = logits.size(0)
-        totals = self.diagnostic_totals[mode]
-
-        totals["ctc_loss_sum"] += ctc_loss.detach().float().item() * batch_size
-        totals["frame_loss_sum"] += frame_loss.detach().float().item() * batch_size
-        totals["sample_count"] += batch_size
 
         if refined_flip_rate is None:
             return
@@ -118,6 +119,7 @@ class HFTrainer(Trainer):
             )
 
         frame_count = int(input_lengths.detach().sum().item())
+        totals = self.diagnostic_totals[mode]
 
         totals["flip_count"] += refined_flip_rate.detach().float().item() * frame_count
         totals["frame_count"] += frame_count
@@ -133,19 +135,13 @@ class HFTrainer(Trainer):
 
     def _add_diagnostics(self, logs, mode):
         totals = self.diagnostic_totals[mode]
-        sample_count = totals["sample_count"]
         frame_count = totals["frame_count"]
 
-        if sample_count == 0:
+        if frame_count == 0:
             return
 
         prefix = "eval_" if mode == "eval" else ""
-
-        logs[prefix + "ctc_loss"] = totals["ctc_loss_sum"] / sample_count
-        logs[prefix + "frame_loss"] = totals["frame_loss_sum"] / sample_count
-
-        if frame_count > 0:
-            logs[prefix + "refined_flip_rate"] = totals["flip_count"] / frame_count
+        logs[prefix + "refined_flip_rate"] = totals["flip_count"] / frame_count
 
         self.diagnostic_totals[mode] = self._new_diagnostics()
 
@@ -158,157 +154,6 @@ class HFTrainer(Trainer):
             yield
         finally:
             self.data_collator = current_collator
-
-    def get_eval_dataloader(self, eval_dataset=None):
-        with self._use_validation_collator():
-            return super().get_eval_dataloader(eval_dataset)
-
-    def get_test_dataloader(self, test_dataset):
-        with self._use_validation_collator():
-            return super().get_test_dataloader(test_dataset)
-
-
-class HFTrainer(Trainer):
-    def __init__(self, *args, validation_collator=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        if self.args.remove_unused_columns:
-            raise ValueError("remove_unused_columns must be False.")
-
-        self.validation_collator = validation_collator or self.data_collator
-        self._train_lengths = None
-        self._diagnostic_totals = {"train": {}, "eval": {}}
-
-        if (
-            self.train_dataset is not None
-            and hasattr(self.train_dataset, "column_names")
-            and self.args.length_column_name in self.train_dataset.column_names
-        ):
-            self._train_lengths = [
-                int(value) for value in self.train_dataset[self.args.length_column_name]
-            ]
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        loss, outputs = super().compute_loss(
-            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
-        )
-
-        if isinstance(outputs, dict):
-            mode = "train" if model.training else "eval"
-            totals = self._diagnostic_totals[mode]
-            ctc_loss = outputs.get("ctc_loss")
-            frame_loss = outputs.get("frame_loss")
-            refined_logits = outputs.get("logits")
-            first_logits = outputs.get("first_logits")
-            input_lengths = outputs.get("input_lengths")
-
-            if (
-                ctc_loss is not None
-                and frame_loss is not None
-                and refined_logits is not None
-            ):
-                batch_size = refined_logits.size(0)
-                totals["ctc_loss_sum"] = (
-                    totals.get("ctc_loss_sum", 0.0)
-                    + ctc_loss.detach().float().item() * batch_size
-                )
-                totals["frame_loss_sum"] = (
-                    totals.get("frame_loss_sum", 0.0)
-                    + frame_loss.detach().float().item() * batch_size
-                )
-                totals["sample_count"] = totals.get("sample_count", 0) + batch_size
-
-            if (
-                refined_logits is not None
-                and first_logits is not None
-                and input_lengths is not None
-            ):
-                time = refined_logits.size(1)
-                valid_mask = torch.arange(time, device=refined_logits.device).unsqueeze(
-                    0
-                ) < input_lengths.unsqueeze(1)
-                refined_ids = refined_logits.detach().argmax(dim=-1)
-                first_ids = first_logits.detach().argmax(dim=-1)
-                totals["flip_count"] = totals.get("flip_count", 0) + int(
-                    refined_ids[valid_mask].ne(first_ids[valid_mask]).sum().item()
-                )
-                totals["frame_count"] = totals.get("frame_count", 0) + int(
-                    valid_mask.sum().item()
-                )
-
-        return (loss, outputs) if return_outputs else loss
-
-    def log(self, logs, start_time=None):
-        if "loss" in logs and self._diagnostic_totals["train"]:
-            self._log_diagnostics(logs, "train")
-
-        if "eval_loss" in logs and self._diagnostic_totals["eval"]:
-            self._log_diagnostics(logs, "eval")
-
-        super().log(logs, start_time)
-
-    def _log_diagnostics(self, logs, mode):
-        totals = self._diagnostic_totals[mode]
-        prefix = "eval_" if mode == "eval" else ""
-        sample_count = totals.get("sample_count", 0)
-        frame_count = totals.get("frame_count", 0)
-
-        if sample_count:
-            logs[prefix + "ctc_loss"] = totals["ctc_loss_sum"] / sample_count
-            logs[prefix + "frame_loss"] = totals["frame_loss_sum"] / sample_count
-
-        if frame_count:
-            logs[prefix + "refined_flip_rate"] = totals["flip_count"] / frame_count
-
-        totals.clear()
-
-    def _get_train_sampler(self, train_dataset=None):
-        dataset = self.train_dataset if train_dataset is None else train_dataset
-
-        if self.args.train_sampling_strategy != "group_by_length" or dataset is None:
-            return super()._get_train_sampler(train_dataset)
-
-        if dataset is self.train_dataset and self._train_lengths is not None:
-            lengths = self._train_lengths
-        elif (
-            hasattr(dataset, "column_names")
-            and self.args.length_column_name in dataset.column_names
-        ):
-            lengths = [int(value) for value in dataset[self.args.length_column_name]]
-        else:
-            return super()._get_train_sampler(train_dataset)
-
-        return LengthGroupedSampler(
-            self.args.train_batch_size * self.args.gradient_accumulation_steps,
-            dataset=dataset,
-            lengths=lengths,
-        )
-
-    def _get_eval_sampler(self, eval_dataset):
-        return SequentialSampler(eval_dataset)
-
-    def _save_checkpoint(self, model, trial):
-        report = self.is_world_process_zero()
-
-        if report:
-            print(f"Saving checkpoint at step {self.state.global_step}...")
-
-        start = time.perf_counter()
-        super()._save_checkpoint(model, trial)
-
-        if report:
-            elapsed = time.perf_counter() - start
-            print(f"Checkpoint saved in {elapsed:.2f} seconds")
-
-    @contextmanager
-    def _use_validation_collator(self):
-        collator = self.data_collator
-        self.data_collator = self.validation_collator
-
-        try:
-            yield
-
-        finally:
-            self.data_collator = collator
 
     def get_eval_dataloader(self, eval_dataset=None):
         with self._use_validation_collator():
