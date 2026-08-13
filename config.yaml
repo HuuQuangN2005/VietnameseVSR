@@ -18,7 +18,7 @@ refiner:
   corruption_rate: 0.1
   corruption_sample_probability: 0.5
   top1_suppression: 0.25
-  wer_weight: 1.0
+  frame_weight: 1.0
 
 training:
   seed: 42

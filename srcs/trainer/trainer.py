@@ -8,10 +8,164 @@ import numpy as np
 import torch
 from torch.utils.data import SequentialSampler
 from torchmetrics.text import WordErrorRate
-from transformers import Trainer
+
+from transformers import Trainer, TrainingArguments
 from transformers.trainer_pt_utils import LengthGroupedSampler
 
 from srcs.nets.utils import ctc_decode
+
+
+class HFTrainer(Trainer):
+    def __init__(
+        self,
+        model,
+        args: TrainingArguments,
+        train_dataset,
+        eval_dataset,
+        train_collator,
+        validation_collator,
+        compute_metrics=None,
+        preprocess_logits_for_metrics=None,
+        callbacks=None,
+    ):
+        if validation_collator is None:
+            raise ValueError("validation_collator must be provided.")
+
+        super().__init__(
+            model=model,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=train_collator,
+            compute_metrics=compute_metrics,
+            preprocess_logits_for_metrics=(preprocess_logits_for_metrics),
+            callbacks=callbacks,
+        )
+
+        if self.args.remove_unused_columns:
+            raise ValueError("remove_unused_columns must be False.")
+
+        self.train_collator = train_collator
+        self.validation_collator = validation_collator
+
+        self.diagnostic_totals = {
+            "train": self._new_diagnostics(),
+            "eval": self._new_diagnostics(),
+        }
+
+    @staticmethod
+    def _new_diagnostics():
+        return {
+            "ctc_loss_sum": 0.0,
+            "frame_loss_sum": 0.0,
+            "sample_count": 0,
+            "flip_count": 0.0,
+            "frame_count": 0,
+        }
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        loss, outputs = super().compute_loss(
+            model=model,
+            inputs=inputs,
+            return_outputs=True,
+            num_items_in_batch=num_items_in_batch,
+        )
+
+        if loss is None:
+            raise RuntimeError("Model output does not contain a loss.")
+
+        if loss.ndim != 0:
+            raise RuntimeError(
+                f"Expected scalar loss, received " f"shape {tuple(loss.shape)}."
+            )
+
+        if isinstance(outputs, dict):
+            mode = "train" if model.training else "eval"
+            self._update_diagnostics(outputs=outputs, mode=mode)
+
+        if return_outputs:
+            return loss, outputs
+
+        return loss
+
+    def _update_diagnostics(self, outputs, mode):
+        ctc_loss = outputs.get("ctc_loss")
+        frame_loss = outputs.get("frame_loss")
+        refined_flip_rate = outputs.get("refined_flip_rate")
+        logits = outputs.get("logits")
+        input_lengths = outputs.get("input_lengths")
+
+        if ctc_loss is None or frame_loss is None:
+            return
+
+        if logits is None:
+            raise RuntimeError("Model output must contain logits.")
+
+        batch_size = logits.size(0)
+        totals = self.diagnostic_totals[mode]
+
+        totals["ctc_loss_sum"] += ctc_loss.detach().float().item() * batch_size
+        totals["frame_loss_sum"] += frame_loss.detach().float().item() * batch_size
+        totals["sample_count"] += batch_size
+
+        if refined_flip_rate is None:
+            return
+
+        if input_lengths is None:
+            raise RuntimeError(
+                "Model output must contain input_lengths "
+                "to aggregate refined_flip_rate."
+            )
+
+        frame_count = int(input_lengths.detach().sum().item())
+
+        totals["flip_count"] += refined_flip_rate.detach().float().item() * frame_count
+        totals["frame_count"] += frame_count
+
+    def log(self, logs, start_time=None):
+        if "loss" in logs:
+            self._add_diagnostics(logs=logs, mode="train")
+
+        if "eval_loss" in logs:
+            self._add_diagnostics(logs=logs, mode="eval")
+
+        super().log(logs=logs, start_time=start_time)
+
+    def _add_diagnostics(self, logs, mode):
+        totals = self.diagnostic_totals[mode]
+        sample_count = totals["sample_count"]
+        frame_count = totals["frame_count"]
+
+        if sample_count == 0:
+            return
+
+        prefix = "eval_" if mode == "eval" else ""
+
+        logs[prefix + "ctc_loss"] = totals["ctc_loss_sum"] / sample_count
+        logs[prefix + "frame_loss"] = totals["frame_loss_sum"] / sample_count
+
+        if frame_count > 0:
+            logs[prefix + "refined_flip_rate"] = totals["flip_count"] / frame_count
+
+        self.diagnostic_totals[mode] = self._new_diagnostics()
+
+    @contextmanager
+    def _use_validation_collator(self):
+        current_collator = self.data_collator
+        self.data_collator = self.validation_collator
+
+        try:
+            yield
+        finally:
+            self.data_collator = current_collator
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        with self._use_validation_collator():
+            return super().get_eval_dataloader(eval_dataset)
+
+    def get_test_dataloader(self, test_dataset):
+        with self._use_validation_collator():
+            return super().get_test_dataloader(test_dataset)
 
 
 class HFTrainer(Trainer):
@@ -41,16 +195,25 @@ class HFTrainer(Trainer):
         if isinstance(outputs, dict):
             mode = "train" if model.training else "eval"
             totals = self._diagnostic_totals[mode]
-            raw_ctc_loss = outputs.get("raw_ctc_loss")
+            ctc_loss = outputs.get("ctc_loss")
+            frame_loss = outputs.get("frame_loss")
             refined_logits = outputs.get("logits")
             first_logits = outputs.get("first_logits")
             input_lengths = outputs.get("input_lengths")
 
-            if raw_ctc_loss is not None and refined_logits is not None:
+            if (
+                ctc_loss is not None
+                and frame_loss is not None
+                and refined_logits is not None
+            ):
                 batch_size = refined_logits.size(0)
-                totals["raw_ctc_loss_sum"] = (
-                    totals.get("raw_ctc_loss_sum", 0.0)
-                    + raw_ctc_loss.detach().float().item() * batch_size
+                totals["ctc_loss_sum"] = (
+                    totals.get("ctc_loss_sum", 0.0)
+                    + ctc_loss.detach().float().item() * batch_size
+                )
+                totals["frame_loss_sum"] = (
+                    totals.get("frame_loss_sum", 0.0)
+                    + frame_loss.detach().float().item() * batch_size
                 )
                 totals["sample_count"] = totals.get("sample_count", 0) + batch_size
 
@@ -90,7 +253,8 @@ class HFTrainer(Trainer):
         frame_count = totals.get("frame_count", 0)
 
         if sample_count:
-            logs[prefix + "raw_ctc_loss"] = totals["raw_ctc_loss_sum"] / sample_count
+            logs[prefix + "ctc_loss"] = totals["ctc_loss_sum"] / sample_count
+            logs[prefix + "frame_loss"] = totals["frame_loss_sum"] / sample_count
 
         if frame_count:
             logs[prefix + "refined_flip_rate"] = totals["flip_count"] / frame_count

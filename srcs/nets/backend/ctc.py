@@ -77,88 +77,93 @@ class CTC(torch.nn.Module):
         return loss
 
 
-class WERGuidedCTCLoss(torch.nn.Module):
-    def __init__(self, tokenizer, wer_weight=1.0):
+class CTCFrameCorrectionLoss(torch.nn.Module):
+    def __init__(self, frame_weight=1.0, eps=1e-6):
         super().__init__()
-        self.tokenizer = tokenizer
-        self.wer_weight = wer_weight
 
-    @torch.no_grad()
-    def _decode_logits(self, logits, input_lengths, blank_id):
-        token_ids = ctc_decode(logits, input_lengths, blank_id)
-        return [self.tokenizer.decode(ids) for ids in token_ids]
+        self.frame_weight = frame_weight
+        self.eps = eps
 
-    @torch.no_grad()
-    def _decode_labels(self, labels, label_lengths):
-        labels = labels.detach().cpu()
-        label_lengths = label_lengths.detach().cpu().tolist()
-        texts = []
+    def _prepare_targets(self, ctc, labels, label_lengths, device):
+        labels = labels.to(device=device, dtype=torch.long)
 
-        for row, length in zip(labels, label_lengths):
-            ids = row[: int(length)].tolist()
-
-            texts.append(self.tokenizer.decode(ids))
-
-        return texts
-
-    @staticmethod
-    def _edit_distance(reference, hypothesis):
-        reference = reference.split()
-        hypothesis = hypothesis.split()
-
-        previous = list(range(len(hypothesis) + 1))
-
-        for i, ref_word in enumerate(reference, start=1):
-            current = [i]
-
-            for j, hyp_word in enumerate(hypothesis, start=1):
-                substitution = previous[j - 1] + int(ref_word != hyp_word)
-                insertion = current[j - 1] + 1
-                deletion = previous[j] + 1
-
-                current.append(min(substitution, insertion, deletion))
-
-            previous = current
-
-        return previous[-1]
-
-    @classmethod
-    def _wer(cls, reference, hypothesis):
-        words = reference.split()
-
-        if len(words) == 0:
-            return float(len(hypothesis.split()) > 0)
-
-        errors = cls._edit_distance(reference, hypothesis)
-
-        return errors / len(words)
-
-    def forward(self, ctc, logits, input_lengths, labels, label_lengths=None):
         if label_lengths is None:
-            label_lengths = labels.ne(ctc.ignore_id).sum(dim=1)
+            label_mask = labels.ne(ctc.ignore_id)
+            label_lengths = label_mask.sum(dim=1)
 
-        ctc_loss = ctc.loss_from_logits(
-            logits, input_lengths, labels, label_lengths, reduce=False
-        )
+        else:
+            label_lengths = label_lengths.to(device=device, dtype=torch.long)
+            positions = torch.arange(labels.size(1), device=device)
+            label_mask = positions.unsqueeze(0) < label_lengths.unsqueeze(1)
 
-        ctc_loss = ctc_loss / label_lengths.to(ctc_loss.device).float().clamp_min(1)
+        targets = labels.masked_select(label_mask)
+
+        return labels, targets, label_lengths
+
+    def _ctc_alignment_posterior(
+        self, ctc, first_logits, input_lengths, targets, label_lengths
+    ):
+        with torch.enable_grad():
+            teacher_logits = first_logits.detach().float().requires_grad_(True)
+            log_probs = teacher_logits.log_softmax(dim=-1).transpose(0, 1)
+
+            teacher_loss = ctc.ctc_loss(
+                log_probs, targets, input_lengths, label_lengths
+            )
+            teacher_loss = teacher_loss.sum()
+
+            gradient = torch.autograd.grad(
+                teacher_loss, teacher_logits, create_graph=False, retain_graph=False
+            )[0]
 
         with torch.no_grad():
-            predictions = self._decode_logits(logits, input_lengths, ctc.blank_id)
-            targets = self._decode_labels(labels, label_lengths)
+            posterior = teacher_logits.softmax(dim=-1)
 
-            wer = torch.tensor(
-                [
-                    self._wer(target, prediction)
-                    for target, prediction in zip(targets, predictions)
-                ],
-                device=logits.device,
-                dtype=ctc_loss.dtype,
-            )
+            gamma = (posterior - gradient).clamp_min(0.0)
+            gamma = gamma / (gamma.sum(dim=-1, keepdim=True).clamp_min(self.eps))
 
-            severity = wer / (1.0 + wer)
-            weight = 1.0 + self.wer_weight * severity
+        return posterior.detach(), gamma.detach()
 
-        loss = (weight * ctc_loss).mean()
+    def forward(
+        self, ctc, first_logits, logits, input_lengths, labels, label_lengths=None
+    ):
+        input_lengths = input_lengths.to(logits.device, dtype=torch.long)
 
-        return {"loss": loss, "raw_ctc_loss": ctc_loss.mean().detach()}
+        labels, targets, label_lengths = self._prepare_targets(
+            ctc, labels, label_lengths, logits.device
+        )
+
+        ctc_loss = ctc.loss_from_logits(logits, input_lengths, labels, label_lengths)
+
+        if ctc_loss.ndim == 0:
+            ctc_loss = ctc_loss / label_lengths.float().mean().clamp_min(1.0)
+
+        else:
+            ctc_loss = (ctc_loss / label_lengths.float().clamp_min(1.0)).mean()
+
+        posterior, gamma = self._ctc_alignment_posterior(
+            ctc, first_logits, input_lengths, targets, label_lengths
+        )
+
+        valid_mask = torch.arange(logits.size(1), device=logits.device).unsqueeze(
+            0
+        ) < input_lengths.unsqueeze(1)
+
+        with torch.no_grad():
+            frame_error = 0.5 * (posterior - gamma).abs().sum(dim=-1)
+            frame_weight = frame_error * valid_mask.float()
+
+        refined_log_probs = logits.float().log_softmax(dim=-1)
+
+        frame_ce = -(gamma * refined_log_probs).sum(dim=-1)
+        frame_loss = (frame_weight * frame_ce).sum() / (
+            frame_weight.sum().clamp_min(self.eps)
+        )
+
+        loss = ctc_loss + self.frame_weight * frame_loss
+
+        return {
+            "loss": loss,
+            "ctc_loss": ctc_loss.detach(),
+            "frame_loss": frame_loss.detach(),
+        }

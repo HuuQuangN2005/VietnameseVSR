@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 
-from srcs.nets.backend.ctc import CTC, WERGuidedCTCLoss
+from srcs.nets.backend.ctc import CTC, CTCFrameCorrectionLoss
 from srcs.nets.backend.encoder.conformer_encoder import ConformerEncoder
 from srcs.nets.backend.frontend.resnet import video_resnet
 from srcs.nets.backend.nets_utils import make_non_pad_mask
@@ -81,13 +81,13 @@ class VSRModel(nn.Module):
         return encoded_features, video_lengths
 
     def get_contexts(self, videos, video_lengths):
-        encoded_features, input_lengths, _ = self.encode(
+        encoded_features, input_lengths, visual_features = self.encode(
             videos, video_lengths, return_visual=True
         )
         _, logits = self.ctc(encoded_features, input_lengths)
 
         return {
-            "visual_features": encoded_features,
+            "visual_features": visual_features,
             "encoded_features": encoded_features,
             "logits": logits,
             "input_lengths": input_lengths,
@@ -95,6 +95,7 @@ class VSRModel(nn.Module):
 
     def forward(self, videos, video_lengths, labels=None, label_lengths=None):
         encoded_features, input_lengths = self.encode(videos, video_lengths)
+
         loss, logits = self.ctc(encoded_features, input_lengths, labels, label_lengths)
 
         return {
@@ -124,13 +125,14 @@ class VisualRefinerVSRModel(nn.Module):
         corruption_rate=0.1,
         corruption_sample_probability=0.5,
         top1_suppression=0.25,
-        wer_weight=1.0,
+        frame_weight=1.0,
         text_transform=None,
         checkpoint_dir=None,
         freeze_baseline=True,
     ):
         super().__init__()
         self.vsr_model = vsr_model
+
         self.refiner = VisualEvidenceCTCRefiner(
             vocab_size=vsr_model.vocab_size,
             d_model=d_model,
@@ -144,10 +146,7 @@ class VisualRefinerVSRModel(nn.Module):
             corruption_sample_probability=corruption_sample_probability,
             top1_suppression=top1_suppression,
         )
-        if text_transform is None:
-            raise ValueError("text_transform is required for WER-guided CTC loss.")
-
-        self.loss_fn = WERGuidedCTCLoss(text_transform, wer_weight)
+        self.loss_fn = CTCFrameCorrectionLoss(frame_weight=frame_weight)
         self.blank_id = vsr_model.blank_id
         self.freeze_baseline = freeze_baseline
 
@@ -188,25 +187,29 @@ class VisualRefinerVSRModel(nn.Module):
             input_lengths=contexts["input_lengths"],
         )
         loss = None
-        raw_ctc_loss = None
+        ctc_loss = None
+        frame_loss = None
 
         if labels is not None:
             loss_output = self.loss_fn(
                 self.vsr_model.ctc,
+                contexts["logits"],
                 refined["logits"],
                 contexts["input_lengths"],
                 labels,
                 label_lengths,
             )
             loss = loss_output["loss"]
-            raw_ctc_loss = loss_output["raw_ctc_loss"]
+            ctc_loss = loss_output["ctc_loss"]
+            frame_loss = loss_output["frame_loss"]
 
         return {
             "loss": loss,
             "logits": refined["logits"],
             "input_lengths": contexts["input_lengths"],
             "first_logits": contexts["logits"],
-            "raw_ctc_loss": raw_ctc_loss,
+            "ctc_loss": ctc_loss,
+            "frame_loss": frame_loss,
             "refined_flip_rate": refined["refined_flip_rate"],
         }
 
