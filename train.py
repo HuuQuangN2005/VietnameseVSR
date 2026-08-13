@@ -17,12 +17,6 @@ from srcs.spm.text_transofm import TextTransform
 from srcs.trainer.trainer import HFTrainer, build_metric_fn, preprocess_logits_for_metrics
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
-PRETRAINED_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "checkpoints",
-    "pretrain",
-    "vsr_trlrs3_base.pth",
-)
 
 
 def load_config(path):
@@ -30,71 +24,98 @@ def load_config(path):
         return yaml.safe_load(file)
 
 
-def get_model(args, text_transform, config):
-    pretrained_path = args.pretrained_weights or args.autoavsr_checkpoint
+def validate_args(args):
+    initialization_count = sum(
+        (
+            bool(args.checkpoint),
+            bool(args.resume_checkpoint),
+            args.from_scratch,
+        )
+    )
 
-    if args.model in ("baseline", "teacher"):
+    if initialization_count != 1:
+        raise ValueError(
+            "Use exactly one of --checkpoint, --resume_checkpoint, or --from_scratch."
+        )
+
+    if args.from_scratch and args.model != "baseline":
+        raise ValueError("--from_scratch is only supported for the baseline model.")
+
+    if args.freeze_frontend and args.model != "baseline":
+        raise ValueError("--freeze_frontend is only supported for the baseline model.")
+
+    if not args.freeze_baseline and args.model != "refiner":
+        raise ValueError("--no-freeze_baseline is only supported for the refiner model.")
+
+
+def get_model(args, text_transform, config):
+    if args.model == "baseline":
         model = create_model(
             args.model,
             text_transform.vocab_size,
-            **config[args.model],
-        )
-        report = load_backbone_weights(model, pretrained_path)
-        print(
-            f"Loaded Auto-AVSR backbone: {len(report['loaded'])} tensors; "
-            f"skipped: {len(report['skipped'])}."
+            **config["baseline"],
         )
 
-        if args.model == "teacher":
-            lora_config = config["lora"]
-
-            if not lora_config["enabled"]:
-                raise ValueError("LoRA must be enabled when training the teacher.")
-
-            replaced = apply_lora(
-                model=model,
-                start_block=lora_config["start_block"],
-                rank=lora_config["rank"],
-                alpha=lora_config["alpha"],
-                dropout_rate=lora_config["dropout_rate"],
-                target_modules=tuple(lora_config["target_modules"]),
+        if args.checkpoint:
+            report = load_backbone_weights(model, args.checkpoint)
+            print(
+                f"Loaded backbone: {len(report['loaded'])} tensors; "
+                f"skipped: {len(report['skipped'])}."
             )
-            print(f"Applied LoRA to {len(replaced)} linear modules.")
-
-        checkpoint_path = args.checkpoint_dir or args.baseline_checkpoint
-
-        if checkpoint_path:
-            load_weights(model, checkpoint_path)
+        elif args.from_scratch:
+            print("Training baseline from scratch.")
 
         if args.freeze_frontend:
             model.freeze_frontend()
 
-    else:
-        if (
-            args.freeze_baseline
-            and args.baseline_checkpoint is None
-            and args.checkpoint_dir is None
-            and args.resume_checkpoint is None
-        ):
-            raise ValueError(
-                "A baseline or full checkpoint is required when the baseline is frozen."
+    elif args.model == "teacher":
+        model = create_model(
+            args.model,
+            text_transform.vocab_size,
+            **config["teacher"],
+        )
+
+        if args.checkpoint:
+            report = load_backbone_weights(model, args.checkpoint)
+            print(
+                f"Loaded backbone: {len(report['loaded'])} tensors; "
+                f"skipped: {len(report['skipped'])}."
             )
 
+        lora_config = config["lora"]
+
+        if not lora_config["enabled"]:
+            raise ValueError("LoRA must be enabled when training the teacher.")
+
+        print(
+            f"Applying LoRA: start_block={lora_config['start_block']}, "
+            f"rank={lora_config['rank']}, alpha={lora_config['alpha']}, "
+            f"targets={lora_config['target_modules']}"
+        )
+
+        replaced = apply_lora(
+            model=model,
+            start_block=lora_config["start_block"],
+            rank=lora_config["rank"],
+            alpha=lora_config["alpha"],
+            dropout_rate=lora_config["dropout_rate"],
+            target_modules=tuple(lora_config["target_modules"]),
+        )
+        print(f"Applied LoRA to {len(replaced)} linear modules.")
+
+    else:
         baseline = create_model(
             "baseline",
             text_transform.vocab_size,
             **config["baseline"],
         )
 
-        if args.baseline_checkpoint:
-            load_weights(baseline, args.baseline_checkpoint)
-        else:
-            report = load_backbone_weights(baseline, pretrained_path)
-            print(f"Loaded Auto-AVSR baseline backbone: {len(report['loaded'])} tensors.")
+        if args.checkpoint:
+            report = load_weights(baseline, args.checkpoint)
+            print(f"Loaded baseline: {report['loaded']} tensors.")
 
         model = VisualRefinerVSRModel(
             baseline,
-            checkpoint_dir=args.checkpoint_dir,
             freeze_baseline=args.freeze_baseline,
             **config["refiner"],
         )
@@ -120,11 +141,9 @@ def parse_args():
     parser.add_argument("--train_fraction", type=float, default=1.0)
     parser.add_argument("--val_fraction", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--pretrained_weights")
-    parser.add_argument("--autoavsr_checkpoint", default=PRETRAINED_PATH)
-    parser.add_argument("--baseline_checkpoint")
-    parser.add_argument("--checkpoint_dir")
+    parser.add_argument("--checkpoint")
     parser.add_argument("--resume_checkpoint")
+    parser.add_argument("--from_scratch", action="store_true")
     parser.add_argument("--freeze_frontend", action="store_true")
     parser.add_argument(
         "--freeze_baseline", action=argparse.BooleanOptionalAction, default=True
@@ -190,6 +209,8 @@ def get_text_transform(train_dataset):
 
 def main():
     args = parse_args()
+    validate_args(args)
+    print(f"Config: {os.path.abspath(args.config)}")
     config = load_config(args.config)
     training_config = config["training"]
     torch.manual_seed(training_config["seed"])

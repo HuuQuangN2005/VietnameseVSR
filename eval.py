@@ -4,9 +4,12 @@ import torch
 from transformers import TrainingArguments
 
 from srcs.datasets.vicocktail import Collator, load_vicocktail
+from srcs.nets.e2e import VisualRefinerVSRModel, get_model as create_model
+from srcs.nets.lora import apply_lora
+from srcs.nets.utils import load_weights
 from srcs.spm.text_transofm import TextTransform
 from srcs.trainer.trainer import HFTrainer, build_metric_fn, preprocess_logits_for_metrics
-from train import CONFIG_PATH, PRETRAINED_PATH, get_model, load_config
+from train import CONFIG_PATH, load_config
 
 
 def parse_args():
@@ -16,18 +19,49 @@ def parse_args():
         "--model", choices=("baseline", "teacher", "refiner"), required=True
     )
     parser.add_argument("--dataset", choices=("vicocktail",), default="vicocktail")
-    parser.add_argument("--checkpoint_dir", required=True)
+    parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output_dir", default="checkpoints/eval")
     parser.add_argument("--test_fraction", type=float, default=1.0)
-    parser.add_argument("--autoavsr_checkpoint", default=PRETRAINED_PATH)
-    parser.add_argument("--pretrained_weights")
-    parser.add_argument("--baseline_checkpoint")
-    parser.add_argument(
-        "--freeze_baseline", action=argparse.BooleanOptionalAction, default=True
-    )
-    parser.set_defaults(freeze_frontend=False, resume_checkpoint=None)
 
     return parser.parse_args()
+
+
+def get_model(args, text_transform, config):
+    if args.model in ("baseline", "teacher"):
+        model = create_model(
+            args.model,
+            text_transform.vocab_size,
+            **config[args.model],
+        )
+
+        if args.model == "teacher":
+            lora_config = config["lora"]
+            apply_lora(
+                model=model,
+                start_block=lora_config["start_block"],
+                rank=lora_config["rank"],
+                alpha=lora_config["alpha"],
+                dropout_rate=lora_config["dropout_rate"],
+                target_modules=tuple(lora_config["target_modules"]),
+            )
+
+    else:
+        baseline = create_model(
+            "baseline",
+            text_transform.vocab_size,
+            **config["baseline"],
+        )
+        model = VisualRefinerVSRModel(
+            baseline,
+            freeze_baseline=True,
+            **config["refiner"],
+        )
+
+    report = load_weights(model, args.checkpoint)
+
+    print(f"Loaded model checkpoint: {report['loaded']} tensors.")
+
+    return model
 
 
 def get_evaluation_args(args, config):

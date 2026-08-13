@@ -9,17 +9,17 @@ from srcs.nets.backend.encoder.conformer_encoder import ConformerEncoder
 from srcs.nets.backend.frontend.resnet import video_resnet
 from srcs.nets.backend.nets_utils import make_non_pad_mask
 from srcs.nets.backend.refiner.refiner import VisualEvidenceCTCRefiner
-from srcs.nets.utils import ctc_decode, freeze, load_weights
+from srcs.nets.utils import ctc_decode, freeze
 
 
 class CustomAutoVSRModel(nn.Module):
     def __init__(
         self,
         vocab_size,
-        attention_dim=256,
-        attention_heads=4,
-        linear_units=1024,
-        num_blocks=4,
+        attention_dim=768,
+        attention_heads=12,
+        linear_units=3072,
+        num_blocks=12,
         dropout_rate=0.1,
         attention_dropout_rate=0.0,
         cnn_module_kernel=31,
@@ -125,7 +125,6 @@ class VisualRefinerVSRModel(nn.Module):
         num_blocks=1,
         dropout_rate=0.1,
         attention_dropout_rate=0.0,
-        checkpoint_dir=None,
         freeze_baseline=True,
     ):
         super().__init__()
@@ -142,14 +141,6 @@ class VisualRefinerVSRModel(nn.Module):
         )
         self.blank_id = vsr_model.blank_id
         self.freeze_baseline = freeze_baseline
-
-        if checkpoint_dir is not None:
-            info = load_weights(self, checkpoint_dir)
-
-            if info["missing"]:
-                raise RuntimeError(
-                    f"Full checkpoint is missing {len(info['missing'])} tensors."
-                )
 
         if freeze_baseline:
             freeze(self.vsr_model)
@@ -202,23 +193,9 @@ class VisualRefinerVSRModel(nn.Module):
 def get_model(
     model_name,
     vocab_size,
-    pretrained_weights=None,
-    checkpoint_path=None,
-    freeze_frontend=False,
     **model_config,
 ):
     if model_name not in ("baseline", "teacher"):
         raise ValueError(f"Unsupported model: {model_name}")
 
-    model = CustomAutoVSRModel(vocab_size=vocab_size, **model_config)
-
-    if pretrained_weights:
-        load_weights(model, pretrained_weights, "frontend")
-
-    if checkpoint_path:
-        load_weights(model, checkpoint_path)
-
-    if freeze_frontend:
-        model.freeze_frontend()
-
-    return model
+    return CustomAutoVSRModel(vocab_size=vocab_size, **model_config)

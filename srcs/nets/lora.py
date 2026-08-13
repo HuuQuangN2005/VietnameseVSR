@@ -1,6 +1,5 @@
 import math
 
-import torch
 import torch.nn as nn
 
 from srcs.nets.utils import freeze

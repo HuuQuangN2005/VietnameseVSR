@@ -26,8 +26,8 @@ refiner:
 
 lora:
   enabled: true
-  start_block: 8
-  rank: 8
+  start_block: 0
+  rank: 16
   alpha: 16
   dropout_rate: 0.05
   target_modules:
@@ -36,9 +36,9 @@ lora:
 
 training:
   seed: 42
-  batch_size: 12
+  batch_size: 4
   num_workers: 4
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 6
   learning_rate: 0.0001
   weight_decay: 0.005
   warmup_ratio: 0.05
@@ -49,5 +49,5 @@ training:
   early_stopping_threshold: 0.001
 
 evaluation:
-  batch_size: 12
+  batch_size: 8
   num_workers: 4

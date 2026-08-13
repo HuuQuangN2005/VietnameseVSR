@@ -8,6 +8,7 @@ import torch
 from torchmetrics.text import WordErrorRate
 
 from transformers import Trainer, TrainingArguments
+from transformers.trainer_pt_utils import LengthGroupedSampler
 
 from srcs.nets.utils import ctc_decode
 
@@ -79,6 +80,25 @@ class HFTrainer(Trainer):
             raise ValueError(
                 "Unexpected trainable parameters: " + ", ".join(unexpected[:10])
             )
+
+    def _get_train_sampler(self, train_dataset=None):
+        dataset = self.train_dataset if train_dataset is None else train_dataset
+        length_column = self.args.length_column_name
+
+        if (
+            self.args.train_sampling_strategy != "group_by_length"
+            or dataset is None
+            or not hasattr(dataset, "column_names")
+            or length_column not in dataset.column_names
+        ):
+            return super()._get_train_sampler(train_dataset)
+
+        lengths = [int(value) for value in dataset[length_column]]
+
+        return LengthGroupedSampler(
+            self.args.train_batch_size * self.args.gradient_accumulation_steps,
+            lengths=lengths,
+        )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         loss, outputs = super().compute_loss(

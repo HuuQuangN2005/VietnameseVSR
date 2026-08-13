@@ -40,7 +40,7 @@ def _weight_path(path):
     raise FileNotFoundError(f"Weights not found: {path}")
 
 
-def load_weights(model, path, part=None):
+def load_weights(model, path):
     if not path:
         raise FileNotFoundError(f"Weights not found: {path}")
 
@@ -52,31 +52,14 @@ def load_weights(model, path, part=None):
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
     source_state = {_strip(key): value for key, value in _state(checkpoint).items()}
-    module = getattr(model, part) if part else model
-    target_state = module.state_dict()
-    loaded = {}
+    try:
+        model.load_state_dict(source_state, strict=True)
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"Checkpoint is incompatible with model: {path}\n{error}"
+        ) from error
 
-    for key, value in source_state.items():
-        names = [key]
-
-        if part and key.startswith(part + "."):
-            names.insert(0, key[len(part) + 1 :])
-
-        for name in names:
-            if name in target_state and target_state[name].shape == value.shape:
-                loaded[name] = value
-                break
-
-    if not loaded:
-        raise RuntimeError(f"No compatible weights found for {part or 'model'}.")
-
-    info = module.load_state_dict(loaded, strict=False)
-
-    return {
-        "loaded": len(loaded),
-        "missing": list(info.missing_keys),
-        "unexpected": list(info.unexpected_keys),
-    }
+    return {"loaded": len(source_state)}
 
 
 def load_backbone_weights(model, path):
