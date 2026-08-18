@@ -1,36 +1,11 @@
-import os
 from collections.abc import Sequence
 
 import torch
 from dotenv import find_dotenv, load_dotenv
 
 
-def root_dir():
-    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-def setup_hf(cache_dir=None):
+def setup_hf():
     load_dotenv(find_dotenv())
-    base = cache_dir or os.path.join(root_dir(), "data", ".hf")
-    cache = os.path.join(base, ".cache")
-    config = {
-        "HF_HOME": base,
-        "HF_HUB_CACHE": os.path.join(cache, "hub"),
-        "HF_DATASETS_CACHE": os.path.join(cache, "datasets"),
-        "HF_ASSETS_CACHE": os.path.join(cache, "assets"),
-        "HF_XET_CACHE": os.path.join(cache, "xet"),
-    }
-    token = os.getenv("HF_TOKEN")
-
-    for key, value in config.items():
-        os.makedirs(value, exist_ok=True)
-        os.environ[key] = value
-
-    if token:
-        os.environ["HF_TOKEN"] = token
-        config["HF_TOKEN"] = token
-
-    return config
 
 
 def to_text(value):

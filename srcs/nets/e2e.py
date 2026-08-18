@@ -8,11 +8,10 @@ from srcs.nets.backend.ctc import CTC
 from srcs.nets.backend.encoder.conformer_encoder import ConformerEncoder
 from srcs.nets.backend.frontend.resnet import video_resnet
 from srcs.nets.backend.nets_utils import make_non_pad_mask
-from srcs.nets.backend.refiner.refiner import VisualEvidenceCTCRefiner
 from srcs.nets.utils import ctc_decode, freeze
 
 
-class CustomAutoVSRModel(nn.Module):
+class VSRModel(nn.Module):
     def __init__(
         self,
         vocab_size,
@@ -115,87 +114,13 @@ class CustomAutoVSRModel(nn.Module):
         return ctc_decode(output["logits"], output["input_lengths"], self.blank_id)
 
 
-class VisualRefinerVSRModel(nn.Module):
-    def __init__(
-        self,
-        vsr_model,
-        attention_dim=256,
-        attention_heads=4,
-        linear_units=1024,
-        num_blocks=1,
-        dropout_rate=0.1,
-        attention_dropout_rate=0.0,
-        freeze_baseline=True,
-    ):
-        super().__init__()
-        self.vsr_model = vsr_model
+def get_model(model: str, vocab_size: int, size: str = "large", **model_config):
+    if model != "auto-vsr":
+        raise ValueError("model must be 'auto-vsr'.")
 
-        self.refiner = VisualEvidenceCTCRefiner(
-            vocab_size=vsr_model.vocab_size,
-            attention_dim=attention_dim,
-            attention_heads=attention_heads,
-            linear_units=linear_units,
-            num_blocks=num_blocks,
-            dropout_rate=dropout_rate,
-            attention_dropout_rate=attention_dropout_rate,
-        )
-        self.blank_id = vsr_model.blank_id
-        self.freeze_baseline = freeze_baseline
+    block_counts = {"large": 12, "small": 6}
 
-        if freeze_baseline:
-            freeze(self.vsr_model)
-        else:
-            self.vsr_model.requires_grad_(True)
+    if size not in block_counts:
+        raise ValueError("size must be 'large' or 'small'.")
 
-            if self.vsr_model.frontend_frozen:
-                freeze(self.vsr_model.frontend)
-
-    def train(self, mode=True):
-        super().train(mode)
-
-        if self.freeze_baseline:
-            self.vsr_model.eval()
-
-        return self
-
-    def forward(self, videos, video_lengths, labels=None, label_lengths=None):
-        if self.freeze_baseline:
-            with torch.no_grad():
-                contexts = self.vsr_model.get_contexts(videos, video_lengths)
-        else:
-            contexts = self.vsr_model.get_contexts(videos, video_lengths)
-
-        refiner_output = self.refiner(
-            logits=contexts["logits"],
-            visual_features=contexts["visual_features"],
-            input_lengths=contexts["input_lengths"],
-        )
-        loss = None
-
-        if labels is not None:
-            loss = self.vsr_model.ctc.loss_from_logits(
-                refiner_output["logits"], contexts["input_lengths"], labels, label_lengths
-            )
-
-        return {
-            "loss": loss,
-            "logits": refiner_output["logits"],
-            "input_lengths": contexts["input_lengths"],
-            "first_logits": contexts["logits"],
-            "refined_flip_rate": refiner_output["refined_flip_rate"],
-        }
-
-    def decode(self, videos, video_lengths):
-        output = self(videos, video_lengths)
-        return ctc_decode(output["logits"], output["input_lengths"], self.blank_id)
-
-
-def get_model(
-    model_name,
-    vocab_size,
-    **model_config,
-):
-    if model_name not in ("baseline", "teacher"):
-        raise ValueError(f"Unsupported model: {model_name}")
-
-    return CustomAutoVSRModel(vocab_size=vocab_size, **model_config)
+    return VSRModel(vocab_size=vocab_size, num_blocks=block_counts[size], **model_config)

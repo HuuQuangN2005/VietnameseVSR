@@ -4,8 +4,8 @@ import torch
 from transformers import TrainingArguments
 
 from srcs.datasets.vicocktail import Collator, load_vicocktail
-from srcs.nets.e2e import VisualRefinerVSRModel, get_model as create_model
-from srcs.nets.lora import apply_lora
+from srcs.nets.e2e import get_model as create_model
+from srcs.nets.lora import LORA_TRAINABLE_PATTERNS, apply_lora_config
 from srcs.nets.utils import load_weights
 from srcs.spm.text_transofm import TextTransform
 from srcs.trainer.trainer import HFTrainer, build_metric_fn, preprocess_logits_for_metrics
@@ -15,47 +15,21 @@ from train import CONFIG_PATH, load_config
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=CONFIG_PATH)
-    parser.add_argument(
-        "--model", choices=("baseline", "teacher", "refiner"), required=True
-    )
-    parser.add_argument("--dataset", choices=("vicocktail",), default="vicocktail")
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--output_dir", default="checkpoints/eval")
+    parser.add_argument("--model", choices=("auto-vsr",), default="auto-vsr")
+    parser.add_argument("--size", choices=("large", "small"), default="large")
+    parser.add_argument("--lora", action="store_true", default=False)
     parser.add_argument("--test_fraction", type=float, default=1.0)
 
     return parser.parse_args()
 
 
 def get_model(args, text_transform, config):
-    if args.model in ("baseline", "teacher"):
-        model = create_model(
-            args.model,
-            text_transform.vocab_size,
-            **config[args.model],
-        )
+    model = create_model(
+        args.model, text_transform.vocab_size, size=args.size, **config["vsr"]
+    )
 
-        if args.model == "teacher":
-            lora_config = config["lora"]
-            apply_lora(
-                model=model,
-                start_block=lora_config["start_block"],
-                rank=lora_config["rank"],
-                alpha=lora_config["alpha"],
-                dropout_rate=lora_config["dropout_rate"],
-                target_modules=tuple(lora_config["target_modules"]),
-            )
-
-    else:
-        baseline = create_model(
-            "baseline",
-            text_transform.vocab_size,
-            **config["baseline"],
-        )
-        model = VisualRefinerVSRModel(
-            baseline,
-            freeze_baseline=True,
-            **config["refiner"],
-        )
+    if args.lora:
+        apply_lora_config(model, config["lora"])
 
     report = load_weights(model, args.checkpoint)
 
@@ -64,9 +38,9 @@ def get_model(args, text_transform, config):
     return model
 
 
-def get_evaluation_args(args, config):
+def get_evaluation_args(config):
     return TrainingArguments(
-        output_dir=args.output_dir,
+        output_dir="checkpoints",
         label_names=["labels", "label_lengths"],
         per_device_eval_batch_size=config["batch_size"],
         fp16=torch.cuda.is_available(),
@@ -75,7 +49,6 @@ def get_evaluation_args(args, config):
         dataloader_pin_memory=torch.cuda.is_available(),
         dataloader_persistent_workers=config["num_workers"] > 0,
         dataloader_prefetch_factor=2 if config["num_workers"] > 0 else None,
-        report_to="none",
     )
 
 
@@ -89,21 +62,17 @@ def main():
     text_transform = TextTransform()
     model = get_model(args, text_transform, config)
     test_collator = Collator(text_transform, "test")
-    allowed_trainable_names = None
-
-    if args.model == "teacher":
-        allowed_trainable_names = ("ctc.", ".lora_a.", ".lora_b.")
 
     trainer = HFTrainer(
         model=model,
-        args=get_evaluation_args(args, evaluation_config),
+        args=get_evaluation_args(evaluation_config),
         train_dataset=None,
         eval_dataset=test_dataset,
         train_collator=test_collator,
         validation_collator=test_collator,
         compute_metrics=build_metric_fn(text_transform),
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        allowed_trainable_names=allowed_trainable_names,
+        allowed_trainable_names=LORA_TRAINABLE_PATTERNS if args.lora else None,
     )
     output = trainer.predict(test_dataset)
 

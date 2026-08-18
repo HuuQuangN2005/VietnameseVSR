@@ -5,13 +5,13 @@ import yaml
 
 from transformers import EarlyStoppingCallback, TrainingArguments
 from srcs.datasets.vicocktail import Collator, load_vicocktail
-from srcs.nets.e2e import VisualRefinerVSRModel, get_model as create_model
+from srcs.nets.e2e import get_model as create_model
 from srcs.nets.lora import (
-    apply_lora,
+    LORA_TRAINABLE_PATTERNS,
+    apply_lora_config,
     print_trainable_parameters,
-    trainable_parameter_names,
 )
-from srcs.nets.utils import load_backbone_weights, load_weights, parameter_count
+from srcs.nets.utils import load_backbone_weights
 from srcs.spm.spm_train import ensure_unigram
 from srcs.spm.text_transofm import TextTransform
 from srcs.trainer.trainer import HFTrainer, build_metric_fn, preprocess_logits_for_metrics
@@ -26,11 +26,7 @@ def load_config(path):
 
 def validate_args(args):
     initialization_count = sum(
-        (
-            bool(args.checkpoint),
-            bool(args.resume_checkpoint),
-            args.from_scratch,
-        )
+        (bool(args.checkpoint), bool(args.resume_checkpoint), args.from_scratch)
     )
 
     if initialization_count != 1:
@@ -38,94 +34,29 @@ def validate_args(args):
             "Use exactly one of --checkpoint, --resume_checkpoint, or --from_scratch."
         )
 
-    if args.from_scratch and args.model != "baseline":
-        raise ValueError("--from_scratch is only supported for the baseline model.")
-
-    if args.freeze_frontend and args.model != "baseline":
-        raise ValueError("--freeze_frontend is only supported for the baseline model.")
-
-    if not args.freeze_baseline and args.model != "refiner":
-        raise ValueError("--no-freeze_baseline is only supported for the refiner model.")
-
 
 def get_model(args, text_transform, config):
-    if args.model == "baseline":
-        model = create_model(
-            args.model,
-            text_transform.vocab_size,
-            **config["baseline"],
-        )
+    model = create_model(
+        args.model, text_transform.vocab_size, size=args.size, **config["vsr"]
+    )
 
-        if args.checkpoint:
-            report = load_backbone_weights(model, args.checkpoint)
-            print(
-                f"Loaded backbone: {len(report['loaded'])} tensors; "
-                f"skipped: {len(report['skipped'])}."
-            )
-        elif args.from_scratch:
-            print("Training baseline from scratch.")
-
-        if args.freeze_frontend:
-            model.freeze_frontend()
-
-    elif args.model == "teacher":
-        model = create_model(
-            args.model,
-            text_transform.vocab_size,
-            **config["teacher"],
-        )
-
-        if args.checkpoint:
-            report = load_backbone_weights(model, args.checkpoint)
-            print(
-                f"Loaded backbone: {len(report['loaded'])} tensors; "
-                f"skipped: {len(report['skipped'])}."
-            )
-
-        lora_config = config["lora"]
-
-        if not lora_config["enabled"]:
-            raise ValueError("LoRA must be enabled when training the teacher.")
-
+    if args.checkpoint:
+        report = load_backbone_weights(model, args.checkpoint)
         print(
-            f"Applying LoRA: start_block={lora_config['start_block']}, "
-            f"rank={lora_config['rank']}, alpha={lora_config['alpha']}, "
-            f"targets={lora_config['target_modules']}"
+            f"Loaded backbone: {len(report['loaded'])} tensors; "
+            f"skipped: {len(report['skipped'])}."
         )
+    elif args.from_scratch:
+        print("Training VSR from scratch.")
 
-        replaced = apply_lora(
-            model=model,
-            start_block=lora_config["start_block"],
-            rank=lora_config["rank"],
-            alpha=lora_config["alpha"],
-            dropout_rate=lora_config["dropout_rate"],
-            target_modules=tuple(lora_config["target_modules"]),
-        )
+    if args.freeze_frontend:
+        model.freeze_frontend()
+
+    if args.lora:
+        replaced = apply_lora_config(model, config["lora"])
         print(f"Applied LoRA to {len(replaced)} linear modules.")
 
-    else:
-        baseline = create_model(
-            "baseline",
-            text_transform.vocab_size,
-            **config["baseline"],
-        )
-
-        if args.checkpoint:
-            report = load_weights(baseline, args.checkpoint)
-            print(f"Loaded baseline: {report['loaded']} tensors.")
-
-        model = VisualRefinerVSRModel(
-            baseline,
-            freeze_baseline=args.freeze_baseline,
-            **config["refiner"],
-        )
-
-    if args.model == "teacher":
-        print_trainable_parameters(model)
-        print(f"Trainable tensors: {len(trainable_parameter_names(model))}")
-    else:
-        print(f"Model parameters: {parameter_count(model):,}")
-        print(f"Trainable parameters: {parameter_count(model, True):,}")
+    print_trainable_parameters(model)
 
     return model
 
@@ -133,10 +64,9 @@ def get_model(args, text_transform, config):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=CONFIG_PATH)
-    parser.add_argument(
-        "--model", choices=("baseline", "teacher", "refiner"), required=True
-    )
-    parser.add_argument("--dataset", choices=("vicocktail",), default="vicocktail")
+    parser.add_argument("--model", choices=("auto-vsr",), default="auto-vsr")
+    parser.add_argument("--size", choices=("large", "small"), default="large")
+    parser.add_argument("--lora", action="store_true", default=False)
     parser.add_argument("--output_dir", default="/checkpoints")
     parser.add_argument("--train_fraction", type=float, default=1.0)
     parser.add_argument("--val_fraction", type=float, default=1.0)
@@ -145,9 +75,6 @@ def parse_args():
     parser.add_argument("--resume_checkpoint")
     parser.add_argument("--from_scratch", action="store_true")
     parser.add_argument("--freeze_frontend", action="store_true")
-    parser.add_argument(
-        "--freeze_baseline", action=argparse.BooleanOptionalAction, default=True
-    )
     return parser.parse_args()
 
 
@@ -178,9 +105,7 @@ def get_training_args(args, config):
         train_sampling_strategy="group_by_length",
         length_column_name="video_length",
         load_best_model_at_end=True,
-        metric_for_best_model=(
-            "eval_refined_wer" if args.model == "refiner" else "eval_wer"
-        ),
+        metric_for_best_model="eval_wer",
         greater_is_better=False,
         save_total_limit=config["save_total_limit"],
         seed=config["seed"],
@@ -225,11 +150,6 @@ def main():
     text_transform = get_text_transform(dataset_splits["train"])
     model = get_model(args, text_transform, config)
 
-    allowed_trainable_names = None
-
-    if args.model == "teacher":
-        allowed_trainable_names = ("ctc.", ".lora_a.", ".lora_b.")
-
     trainer = HFTrainer(
         model=model,
         args=get_training_args(args, training_config),
@@ -239,7 +159,7 @@ def main():
         validation_collator=Collator(text_transform, "val"),
         compute_metrics=build_metric_fn(text_transform),
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        allowed_trainable_names=allowed_trainable_names,
+        allowed_trainable_names=LORA_TRAINABLE_PATTERNS if args.lora else None,
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=training_config["early_stopping_patience"],

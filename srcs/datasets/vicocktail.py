@@ -97,10 +97,9 @@ def load_vicocktail(
     test_fraction=1.0,
     validation_size=0.03,
     seed=42,
-    cache_dir=None,
     splits=("train", "val", "test"),
 ):
-    config = setup_hf(cache_dir)
+    setup_hf()
     splits = tuple(splits)
 
     if not set(splits).issubset({"train", "val", "test"}):
@@ -109,9 +108,7 @@ def load_vicocktail(
     output = DatasetDict()
 
     if "train" in splits or "val" in splits:
-        train_source = hf_load_dataset(
-            HF_NAME, split="train", streaming=False, cache_dir=config["HF_DATASETS_CACHE"]
-        )
+        train_source = hf_load_dataset(HF_NAME, split="train", streaming=False)
         clean_dataset = _add_video_length(_clean(train_source))
         train_dataset, validation_dataset = _split_validation(
             clean_dataset, validation_size, seed
@@ -126,9 +123,7 @@ def load_vicocktail(
             )
 
     if "test" in splits:
-        test_dataset = hf_load_dataset(
-            HF_NAME, split="test", streaming=False, cache_dir=config["HF_DATASETS_CACHE"]
-        )
+        test_dataset = hf_load_dataset(HF_NAME, split="test", streaming=False)
         output["test"] = _select_fraction(
             _add_video_length(_clean(test_dataset)), test_fraction, seed
         )

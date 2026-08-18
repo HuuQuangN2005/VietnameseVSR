@@ -1,69 +1,187 @@
 import torch
 import torch.nn as nn
 
-from srcs.nets.backend.decoder.transformer_decoder import TransformerDecoder
-from srcs.nets.backend.nets_utils import make_non_pad_mask
+from srcs.nets.backend.transformer.attention import LocalMultiHeadedAttention
 
 
-class VisualEvidenceCTCRefiner(nn.Module):
+class MyRefiner(nn.Module):
     def __init__(
         self,
-        vocab_size,
-        attention_dim=256,
-        attention_heads=4,
-        linear_units=1024,
-        num_blocks=1,
-        dropout_rate=0.1,
-        attention_dropout_rate=0.0,
-        correction_init_std=1e-3,
+        vocab_size: int,
+        attn_dim: int = 512,
+        attn_head: int = 8,
+        visual_dim: int = None,
+        window_size: int = 3,
+        blank_id: int = 0,
+        k: int = 0,
+        blank_reduce: float = 0.5,
+        residual_scale: float = 0.1,
+        attn_dropout: float = 0.0,
+        dropout: float = 0.1,
     ):
         super().__init__()
 
-        self.posterior_proj = nn.Linear(vocab_size, attention_dim)
+        assert k >= 0
 
-        self.decoder = TransformerDecoder(
-            odim=vocab_size,
-            attention_dim=attention_dim,
-            attention_heads=attention_heads,
-            linear_units=linear_units,
-            num_blocks=num_blocks,
-            dropout_rate=dropout_rate,
-            positional_dropout_rate=dropout_rate,
-            self_attention_dropout_rate=attention_dropout_rate,
-            src_attention_dropout_rate=attention_dropout_rate,
-            input_layer=nn.Identity(),
-            use_output_layer=False,
+        if not 0.0 <= blank_reduce <= 1.0:
+            raise ValueError(f"blank_reduce must be between 0 and 1, got {blank_reduce}.")
+
+        self.vocab_size = vocab_size
+        self.attn_dim = attn_dim
+        self.visual_dim = visual_dim
+        self.blank_id = blank_id
+        self.blank_reduce = blank_reduce
+        self.residual_scale = residual_scale
+        self.k = k
+
+        self.p_proj = nn.Linear(vocab_size, attn_dim)
+
+        self.v_proj = (
+            nn.Linear(visual_dim, attn_dim) if visual_dim is not None else nn.Identity()
         )
 
-        self.correction_head = nn.Linear(attention_dim, vocab_size)
+        self.cross_attn = LocalMultiHeadedAttention(
+            n_head=attn_head,
+            n_feat=attn_dim,
+            window_size=window_size,
+            dropout_rate=attn_dropout,
+        )
 
-        nn.init.normal_(self.correction_head.weight, mean=0.0, std=correction_init_std)
-        nn.init.zeros_(self.correction_head.bias)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, logits, visual_features, input_lengths):
-        if logits.shape[:2] != visual_features.shape[:2]:
-            raise ValueError(
-                "logits and visual_features must have the same batch and time dimensions."
+        self.norm1 = nn.LayerNorm(attn_dim)
+        self.norm2 = nn.LayerNorm(attn_dim)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(attn_dim, attn_dim * 4),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(attn_dim * 4, attn_dim),
+        )
+
+        self.output_head = nn.Linear(attn_dim, vocab_size)
+
+    def normalize_blank(self, p_old: torch.Tensor) -> torch.Tensor:
+        """
+        Adaptive blank softening.
+
+        Args:
+            p_old: [B, T, V]
+
+        Returns:
+            p_soft: [B, T, V]
+        """
+        p_old = p_old.float()
+        eps = torch.finfo(p_old.dtype).eps
+
+        p_blank = p_old[..., self.blank_id : self.blank_id + 1]
+
+        p_nonblank = p_old.clone()
+        p_nonblank[..., self.blank_id] = 0.0
+
+        nonblank_mass = 1.0 - p_blank
+        p_nb = p_nonblank / nonblank_mass.clamp_min(eps)
+
+        g = self.blank_reduce * p_blank
+
+        # P_soft = (1-g) P_old + g P_nb
+        p_soft = (1.0 - g) * p_old + g * p_nb
+
+        return p_soft
+
+    def refine_once(
+        self,
+        p_input: torch.Tensor,
+        visual_memory: torch.Tensor = None,
+        mask: torch.Tensor = None,
+        return_attn: bool = False,
+    ):
+        """
+        One shared-weight refinement step.
+
+        Args:
+            p_input: [B, T, V]
+            visual_memory: [B, T, D]
+        """
+
+        h_post = self.p_proj(p_input)
+
+        q = h_post
+
+        if visual_memory is None:
+            k = h_post
+            v = h_post
+        else:
+            k = visual_memory
+            v = visual_memory
+
+        if return_attn:
+            h_attn, attn = self.cross_attn(
+                query=q, key=k, value=v, mask=mask, rtn_attn=True
             )
 
-        input_mask = make_non_pad_mask(input_lengths, logits[..., 0])
-        attention_mask = input_mask.unsqueeze(1)
+        else:
+            h_attn = self.cross_attn(query=q, key=k, value=v, mask=mask, rtn_attn=False)
+            attn = None
 
-        posterior = torch.softmax(logits, dim=-1)
-        posterior_features = self.posterior_proj(posterior)
+        h = self.norm1(h_post + self.dropout(h_attn))
+        h = self.norm2(h + self.dropout(self.ffn(h)))
 
-        reconsidered_features, _ = self.decoder(
-            posterior_features, attention_mask, visual_features, attention_mask
-        )
+        delta_logits = self.output_head(h)
 
-        correction_logits = self.correction_head(reconsidered_features)
-        refined_logits = logits + correction_logits
+        return delta_logits, attn
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        visual_feats: torch.Tensor = None,
+        mask: torch.Tensor = None,
+        return_attn: bool = False,
+    ):
+
+        base_logits = logits.detach()
 
         with torch.no_grad():
-            initial_ids = logits.argmax(dim=-1)
-            refined_ids = refined_logits.argmax(dim=-1)
-            refined_flip_rate = (
-                refined_ids[input_mask].ne(initial_ids[input_mask]).float().mean()
+            p_old = base_logits.softmax(dim=-1)
+            p_soft = self.normalize_blank(p_old)
+
+        if visual_feats is not None:
+            visual_memory = self.v_proj(visual_feats)
+        else:
+            visual_memory = None
+
+        p_current = p_soft
+        current_logits = base_logits
+
+        logits_steps = []
+        posterior_steps = []
+        delta_logits_steps = []
+        attention_steps = []
+
+        for _ in range(self.k + 1):
+            delta_logits, attn = self.refine_once(
+                p_input=p_current,
+                visual_memory=visual_memory,
+                mask=mask,
+                return_attn=return_attn,
             )
 
-        return {"logits": refined_logits, "refined_flip_rate": refined_flip_rate}
+            new_logits = current_logits + self.residual_scale * delta_logits
+            p_new = new_logits.softmax(dim=-1)
+
+            logits_steps.append(new_logits)
+            posterior_steps.append(p_new)
+            delta_logits_steps.append(delta_logits)
+
+            if return_attn:
+                attention_steps.append(attn)
+
+            p_current = p_new
+            current_logits = new_logits
+
+        return {
+            "logits_steps": logits_steps,
+            "posterior_steps": posterior_steps,
+            "delta_logits_steps": delta_logits_steps,
+            "attention_steps": (attention_steps if return_attn else None),
+        }

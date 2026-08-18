@@ -4,6 +4,8 @@ import torch.nn as nn
 
 from srcs.nets.utils import freeze
 
+LORA_TRAINABLE_PATTERNS = ("ctc.", ".lora_a.", ".lora_b.")
+
 
 class LoRALinear(nn.Module):
     def __init__(self, linear, rank=8, alpha=16, dropout_rate=0.05):
@@ -74,10 +76,15 @@ def apply_lora(
     return replaced
 
 
-def trainable_parameter_names(model):
-    return [
-        name for name, parameter in model.named_parameters() if parameter.requires_grad
-    ]
+def apply_lora_config(model, config):
+    return apply_lora(
+        model=model,
+        start_block=config["start_block"],
+        rank=config["rank"],
+        alpha=config["alpha"],
+        dropout_rate=config["dropout_rate"],
+        target_modules=tuple(config["target_modules"]),
+    )
 
 
 def print_trainable_parameters(model):
