@@ -50,28 +50,27 @@ class VSRModel(nn.Module):
 
         self.vocab_size = vocab_size
         self.blank_id = blank_id
-        self.frontend_frozen = False
-        self.lora_finetuning = False
+        self._frozen_modules = []
 
-    def freeze_frontend(self):
-        freeze(self.frontend)
-        self.frontend_frozen = True
+    def finetune(self):
+        blocks = self.encoder.encoders
+        freeze(self)
+        blocks[-2:].requires_grad_(True)
+        self.ctc.ctc_lo.requires_grad_(True)
+
+        self._frozen_modules = [
+            self.frontend,
+            self.proj_encoder,
+            self.encoder.embed,
+            *blocks[:-2],
+            self.encoder.after_norm,
+        ]
 
     def train(self, mode=True):
         super().train(mode)
 
-        if self.frontend_frozen:
-            self.frontend.eval()
-
-        if self.lora_finetuning:
-            self.frontend.eval()
-            self.proj_encoder.eval()
-            self.encoder.eval()
-            self.ctc.train(mode)
-
-            for module in self.encoder.modules():
-                if getattr(module, "is_lora", False):
-                    module.train(mode)
+        for module in self._frozen_modules:
+            module.eval()
 
         return self
 

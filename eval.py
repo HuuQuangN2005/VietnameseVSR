@@ -5,8 +5,8 @@ from transformers import TrainingArguments
 
 from srcs.datasets.vicocktail import Collator, load_vicocktail
 from srcs.nets.e2e import get_model as create_model
-from srcs.nets.lora import LORA_TRAINABLE_PATTERNS, apply_lora_config
 from srcs.nets.utils import load_weights
+from srcs.spm.spm_train import ensure_unigram
 from srcs.spm.text_transofm import TextTransform
 from srcs.trainer.trainer import HFTrainer, build_metric_fn, preprocess_logits_for_metrics
 from train import CONFIG_PATH, load_config
@@ -17,19 +17,14 @@ def parse_args():
     parser.add_argument("--config", default=CONFIG_PATH)
     parser.add_argument("--model", choices=("auto-vsr",), default="auto-vsr")
     parser.add_argument("--size", choices=("large", "small"), default="large")
-    parser.add_argument("--lora", action="store_true", default=False)
+    parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--test_fraction", type=float, default=1.0)
 
     return parser.parse_args()
 
 
-def get_model(args, text_transform, config):
-    model = create_model(
-        args.model, text_transform.vocab_size, size=args.size, **config["vsr"]
-    )
-
-    if args.lora:
-        apply_lora_config(model, config["lora"])
+def get_model(args, text_transform):
+    model = create_model(args.model, text_transform.vocab_size, size=args.size)
 
     report = load_weights(model, args.checkpoint)
 
@@ -59,8 +54,9 @@ def main():
     test_dataset = load_vicocktail(test_fraction=args.test_fraction, splits=("test",))[
         "test"
     ]
-    text_transform = TextTransform()
-    model = get_model(args, text_transform, config)
+    model_path, units_path = ensure_unigram()
+    text_transform = TextTransform(model_path, units_path)
+    model = get_model(args, text_transform)
     test_collator = Collator(text_transform, "test")
 
     trainer = HFTrainer(
@@ -72,7 +68,6 @@ def main():
         validation_collator=test_collator,
         compute_metrics=build_metric_fn(text_transform),
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        allowed_trainable_names=LORA_TRAINABLE_PATTERNS if args.lora else None,
     )
     output = trainer.predict(test_dataset)
 

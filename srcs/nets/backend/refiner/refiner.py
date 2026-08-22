@@ -1,7 +1,16 @@
 import torch
 import torch.nn as nn
 
-from srcs.nets.backend.transformer.attention import LocalMultiHeadedAttention
+from srcs.nets.backend.transformer.attention import (
+    LocalMultiHeadedAttention,
+    MultiHeadedAttention,
+)
+from srcs.nets.backend.refiner.utils import make_soft_blank_posterior
+from srcs.nets.backend.transformer.positionwise_feed_forward import (
+    PositionwiseFeedForward,
+)
+from srcs.nets.backend.transformer.layer_norm import LayerNorm
+from srcs.nets.backend.nets_utils import make_non_pad_mask
 
 
 class MyRefiner(nn.Module):
@@ -185,3 +194,79 @@ class MyRefiner(nn.Module):
             "delta_logits_steps": delta_logits_steps,
             "attention_steps": (attention_steps if return_attn else None),
         }
+
+
+class RefinerLayer(nn.Module):
+    def __init__(
+        self,
+        attn_dim: int = 512,
+        attn_head: int = 8,
+        ffn_dim: int = 2048,
+        attn_dropout: float = 0.0,
+        dropout: float = 0.1,
+        normalize_before: bool = True,
+    ):
+        super().__init__()
+        self.normalize_before = normalize_before
+
+        self.norm_self = LayerNorm(attn_dim)
+        self.norm_cross = LayerNorm(attn_dim)
+        self.norm_ffn = LayerNorm(attn_dim)
+
+        self.self_mha = MultiHeadedAttention(
+            n_head=attn_head, n_feat=attn_dim, dropout_rate=attn_dropout
+        )
+        self.cross_mha = MultiHeadedAttention(
+            n_head=attn_head, n_feat=attn_dim, dropout_rate=attn_dropout
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self, q: torch.tensor, k: torch.tensor, v: torch.tensor, mask: torch.Tensor
+    ):
+        ctx_q = self.self_mha(q, q, q, mask.unsqueeze(-2))
+
+
+class Refiner(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        visual_dim: int = 512,
+        attn_dim: int = 512,
+        blank_id: int = 0,
+        reduce_ratio: float = 0.5,
+    ):
+        super().__init__()
+        self.blank_id = blank_id
+        self.reduce_ratio = reduce_ratio
+
+        self.visual_proj = nn.Linear(visual_dim, attn_dim)
+        self.posterior_proj = nn.Linear(vocab_size, attn_dim)
+        self.fusion = nn.Linear(2 * attn_dim, attn_dim)
+
+        self.norm_k = LayerNorm(attn_dim)
+        self.norm_v = LayerNorm(attn_dim)
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        visual_feats: torch.Tensor,
+        video_lengths,
+        return_attn: bool = False,
+    ):
+        logits = logits.detach()
+
+        with torch.no_grad():
+            p_old = logits.softmax(dim=-1)
+            p_soft = make_soft_blank_posterior(p_old, self.blank_id, self.reduce_ratio)
+
+        valid_mask = make_non_pad_mask(video_lengths).to(
+            device=logits.device, dtype=torch.bool
+        )  # [B,T]
+
+        posterior_emb = self.posterior_proj(p_soft)
+        visual_emb = self.visual_proj(visual_feats)
+
+        k = self.norm_k(self.fusion(torch.cat([posterior_emb, visual_emb], dim=-1)))
+        v = self.norm_v(visual_emb)

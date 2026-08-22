@@ -1,16 +1,38 @@
 import argparse
 import os
+
 import torch
 import yaml
-
 from transformers import EarlyStoppingCallback, TrainingArguments
+
 from srcs.datasets.vicocktail import Collator, load_vicocktail
 from srcs.nets.e2e import get_model as create_model
+from srcs.nets.utils import load_backbone_weights
 from srcs.spm.spm_train import ensure_unigram
 from srcs.spm.text_transofm import TextTransform
-from srcs.trainer.trainer import HFTrainer, build_metric_fn, preprocess_logits_for_metrics
+from srcs.trainer.trainer import (
+    FinetuneTrainer,
+    build_metric_fn,
+    preprocess_logits_for_metrics,
+)
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.yaml")
+PRETRAINED_CHECKPOINT = os.path.join(
+    PROJECT_ROOT, "checkpoints", "pretrain", "vsr_trlrs2lrs3vox2avsp_base.pth"
+)
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "checkpoints", "finetune_vsr_12")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=CONFIG_PATH)
+    parser.add_argument("--checkpoint", default=PRETRAINED_CHECKPOINT)
+    parser.add_argument("--output_dir", default=OUTPUT_DIR)
+    parser.add_argument("--train_fraction", type=float, default=1.0)
+    parser.add_argument("--val_fraction", type=float, default=1.0)
+    parser.add_argument("--epochs", type=int, required=True)
+    return parser.parse_args()
 
 
 def load_config(path):
@@ -18,20 +40,17 @@ def load_config(path):
         return yaml.safe_load(file)
 
 
-def get_model(args, text_transform):
-    return create_model(args.model, text_transform.vocab_size, size=args.size)
+def load_model(vocab_size, checkpoint_path):
+    model = create_model("auto-vsr", vocab_size, size="large")
+    load_backbone_weights(model, checkpoint_path)
+    model.finetune()
 
+    trainable_parameters = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    print(f"Trainable parameters: {trainable_parameters:,}")
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=CONFIG_PATH)
-    parser.add_argument("--model", choices=("auto-vsr",), default="auto-vsr")
-    parser.add_argument("--size", choices=("large", "small"), default="large")
-    parser.add_argument("--output_dir", default="/checkpoints")
-    parser.add_argument("--train_fraction", type=float, default=1.0)
-    parser.add_argument("--val_fraction", type=float, default=1.0)
-    parser.add_argument("--epochs", type=int, default=40)
-    return parser.parse_args()
+    return model
 
 
 def get_training_args(args, config):
@@ -42,7 +61,7 @@ def get_training_args(args, config):
         per_device_eval_batch_size=config["batch_size"],
         num_train_epochs=args.epochs,
         gradient_accumulation_steps=config["gradient_accumulation_steps"],
-        learning_rate=config["learning_rate"],
+        learning_rate=config["encoder_lr"],
         weight_decay=config["weight_decay"],
         warmup_steps=config["warmup_steps"],
         max_grad_norm=config["max_grad_norm"],
@@ -69,56 +88,51 @@ def get_training_args(args, config):
 
 def main():
     args = parse_args()
-    print(f"Config: {os.path.abspath(args.config)}")
     config = load_config(args.config)
-    training_config = config["training"]
-    torch.manual_seed(training_config["seed"])
+    finetuning_config = config["finetuning"]
+    torch.manual_seed(finetuning_config["seed"])
 
-    dataset_splits = load_vicocktail(
+    datasets = load_vicocktail(
         train_fraction=args.train_fraction,
         validation_fraction=args.val_fraction,
         splits=("train", "val"),
+        seed=finetuning_config["seed"],
     )
+    train_dataset = datasets["train"]
+    validation_dataset = datasets["val"]
 
-    model_path, units_path = ensure_unigram(dataset_splits["train"])
+    model_path, units_path = ensure_unigram(train_dataset)
     text_transform = TextTransform(model_path, units_path)
-    model = get_model(args, text_transform)
+    model = load_model(text_transform.vocab_size, args.checkpoint)
 
-    trainer = HFTrainer(
+    trainer = FinetuneTrainer(
         model=model,
-        args=get_training_args(args, training_config),
-        train_dataset=dataset_splits["train"],
-        eval_dataset=dataset_splits["val"],
+        args=get_training_args(args, finetuning_config),
+        train_dataset=train_dataset,
+        eval_dataset=validation_dataset,
         train_collator=Collator(text_transform, "train"),
         validation_collator=Collator(text_transform, "val"),
         compute_metrics=build_metric_fn(text_transform),
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        encoder_lr=finetuning_config["encoder_lr"],
+        ctc_head_lr=finetuning_config["ctc_head_lr"],
         callbacks=[
             EarlyStoppingCallback(
-                early_stopping_patience=training_config["early_stopping_patience"],
-                early_stopping_threshold=training_config["early_stopping_threshold"],
+                early_stopping_patience=finetuning_config["early_stopping_patience"],
+                early_stopping_threshold=finetuning_config["early_stopping_threshold"],
             )
         ],
     )
 
     trainer.train()
-    final_dir = os.path.join(args.output_dir, "final")
-
-    trainer.save_model(final_dir)
     trainer.save_state()
 
-    if trainer.is_world_process_zero():
-        completed_epoch = trainer.state.epoch or 0.0
-        stopped_early = completed_epoch + 1e-6 < args.epochs
-        status = "Early stopping" if stopped_early else "Training completed"
+    final_dir = os.path.join(args.output_dir, "final")
+    trainer.save_model(final_dir)
 
-        print(f"{status} at epoch {completed_epoch:g}")
-
-        if trainer.state.best_metric is not None:
-            print(f"Best validation WER: {trainer.state.best_metric:.6f}")
-
-        print(f"Best checkpoint: {trainer.state.best_model_checkpoint}")
-        print(f"Final model: {final_dir}")
+    print(f"Best validation WER: {trainer.state.best_metric}")
+    print(f"Best checkpoint: {trainer.state.best_model_checkpoint}")
+    print(f"Final model: {final_dir}")
 
 
 if __name__ == "__main__":
