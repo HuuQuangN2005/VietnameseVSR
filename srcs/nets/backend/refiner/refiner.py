@@ -1,199 +1,13 @@
 import torch
 import torch.nn as nn
 
-from srcs.nets.backend.transformer.attention import (
-    LocalMultiHeadedAttention,
-    MultiHeadedAttention,
-)
 from srcs.nets.backend.refiner.utils import make_soft_blank_posterior
 from srcs.nets.backend.transformer.positionwise_feed_forward import (
     PositionwiseFeedForward,
 )
 from srcs.nets.backend.transformer.layer_norm import LayerNorm
+from srcs.nets.backend.transformer.repeat import repeat
 from srcs.nets.backend.nets_utils import make_non_pad_mask
-
-
-class MyRefiner(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        attn_dim: int = 512,
-        attn_head: int = 8,
-        visual_dim: int = None,
-        window_size: int = 3,
-        blank_id: int = 0,
-        k: int = 0,
-        blank_reduce: float = 0.5,
-        residual_scale: float = 0.1,
-        attn_dropout: float = 0.0,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-
-        assert k >= 0
-
-        if not 0.0 <= blank_reduce <= 1.0:
-            raise ValueError(f"blank_reduce must be between 0 and 1, got {blank_reduce}.")
-
-        self.vocab_size = vocab_size
-        self.attn_dim = attn_dim
-        self.visual_dim = visual_dim
-        self.blank_id = blank_id
-        self.blank_reduce = blank_reduce
-        self.residual_scale = residual_scale
-        self.k = k
-
-        self.p_proj = nn.Linear(vocab_size, attn_dim)
-
-        self.v_proj = (
-            nn.Linear(visual_dim, attn_dim) if visual_dim is not None else nn.Identity()
-        )
-
-        self.cross_attn = LocalMultiHeadedAttention(
-            n_head=attn_head,
-            n_feat=attn_dim,
-            window_size=window_size,
-            dropout_rate=attn_dropout,
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-        self.norm1 = nn.LayerNorm(attn_dim)
-        self.norm2 = nn.LayerNorm(attn_dim)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(attn_dim, attn_dim * 4),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(attn_dim * 4, attn_dim),
-        )
-
-        self.output_head = nn.Linear(attn_dim, vocab_size)
-
-    def normalize_blank(self, p_old: torch.Tensor) -> torch.Tensor:
-        """
-        Adaptive blank softening.
-
-        Args:
-            p_old: [B, T, V]
-
-        Returns:
-            p_soft: [B, T, V]
-        """
-        p_old = p_old.float()
-        eps = torch.finfo(p_old.dtype).eps
-
-        p_blank = p_old[..., self.blank_id : self.blank_id + 1]
-
-        p_nonblank = p_old.clone()
-        p_nonblank[..., self.blank_id] = 0.0
-
-        nonblank_mass = 1.0 - p_blank
-        p_nb = p_nonblank / nonblank_mass.clamp_min(eps)
-
-        g = self.blank_reduce * p_blank
-
-        # P_soft = (1-g) P_old + g P_nb
-        p_soft = (1.0 - g) * p_old + g * p_nb
-
-        return p_soft
-
-    def refine_once(
-        self,
-        p_input: torch.Tensor,
-        visual_memory: torch.Tensor = None,
-        mask: torch.Tensor = None,
-        return_attn: bool = False,
-    ):
-        """
-        One shared-weight refinement step.
-
-        Args:
-            p_input: [B, T, V]
-            visual_memory: [B, T, D]
-        """
-
-        h_post = self.p_proj(p_input)
-
-        q = h_post
-
-        if visual_memory is None:
-            k = h_post
-            v = h_post
-        else:
-            k = visual_memory
-            v = visual_memory
-
-        if return_attn:
-            h_attn, attn = self.cross_attn(
-                query=q, key=k, value=v, mask=mask, rtn_attn=True
-            )
-
-        else:
-            h_attn = self.cross_attn(query=q, key=k, value=v, mask=mask, rtn_attn=False)
-            attn = None
-
-        h = self.norm1(h_post + self.dropout(h_attn))
-        h = self.norm2(h + self.dropout(self.ffn(h)))
-
-        delta_logits = self.output_head(h)
-
-        return delta_logits, attn
-
-    def forward(
-        self,
-        logits: torch.Tensor,
-        visual_feats: torch.Tensor = None,
-        mask: torch.Tensor = None,
-        return_attn: bool = False,
-    ):
-
-        base_logits = logits.detach()
-
-        with torch.no_grad():
-            p_old = base_logits.softmax(dim=-1)
-            p_soft = self.normalize_blank(p_old)
-
-        if visual_feats is not None:
-            visual_memory = self.v_proj(visual_feats)
-        else:
-            visual_memory = None
-
-        p_current = p_soft
-        current_logits = base_logits
-
-        logits_steps = []
-        posterior_steps = []
-        delta_logits_steps = []
-        attention_steps = []
-
-        for _ in range(self.k + 1):
-            delta_logits, attn = self.refine_once(
-                p_input=p_current,
-                visual_memory=visual_memory,
-                mask=mask,
-                return_attn=return_attn,
-            )
-
-            new_logits = current_logits + self.residual_scale * delta_logits
-            p_new = new_logits.softmax(dim=-1)
-
-            logits_steps.append(new_logits)
-            posterior_steps.append(p_new)
-            delta_logits_steps.append(delta_logits)
-
-            if return_attn:
-                attention_steps.append(attn)
-
-            p_current = p_new
-            current_logits = new_logits
-
-        return {
-            "logits_steps": logits_steps,
-            "posterior_steps": posterior_steps,
-            "delta_logits_steps": delta_logits_steps,
-            "attention_steps": (attention_steps if return_attn else None),
-        }
 
 
 class RefinerLayer(nn.Module):
@@ -204,58 +18,143 @@ class RefinerLayer(nn.Module):
         ffn_dim: int = 2048,
         attn_dropout: float = 0.0,
         dropout: float = 0.1,
-        normalize_before: bool = True,
     ):
         super().__init__()
-        self.normalize_before = normalize_before
 
         self.norm_self = LayerNorm(attn_dim)
         self.norm_cross = LayerNorm(attn_dim)
         self.norm_ffn = LayerNorm(attn_dim)
 
-        self.self_mha = MultiHeadedAttention(
-            n_head=attn_head, n_feat=attn_dim, dropout_rate=attn_dropout
+        self.self_mha = nn.MultiheadAttention(
+            embed_dim=attn_dim,
+            num_heads=attn_head,
+            dropout=attn_dropout,
+            batch_first=True,
         )
-        self.cross_mha = MultiHeadedAttention(
-            n_head=attn_head, n_feat=attn_dim, dropout_rate=attn_dropout
+        self.cross_mha = nn.MultiheadAttention(
+            embed_dim=attn_dim,
+            num_heads=attn_head,
+            dropout=attn_dropout,
+            batch_first=True,
+        )
+        self.ffn = PositionwiseFeedForward(
+            idim=attn_dim, hidden_units=ffn_dim, dropout_rate=dropout
         )
 
         self.dropout = nn.Dropout(dropout)
 
     def forward(
-        self, q: torch.tensor, k: torch.tensor, v: torch.tensor, mask: torch.Tensor
+        self,
+        q_emb: torch.Tensor,
+        k_emb: torch.Tensor,
+        v_emb: torch.Tensor,
+        mask: torch.Tensor,
+        local_mask: torch.Tensor,
     ):
-        ctx_q = self.self_mha(q, q, q, mask.unsqueeze(-2))
+        padding_mask = ~mask
+        query_mask = mask.unsqueeze(-1)
+
+        residual = q_emb
+        self_output, _ = self.self_mha(
+            q_emb, q_emb, q_emb, key_padding_mask=padding_mask, need_weights=False
+        )
+        q_emb = self.norm_self(residual + self.dropout(self_output)) * query_mask
+
+        residual = q_emb
+        cross_output, _ = self.cross_mha(
+            q_emb,
+            k_emb,
+            v_emb,
+            attn_mask=local_mask,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )
+        q_emb = self.norm_cross(residual + self.dropout(cross_output)) * query_mask
+
+        residual = q_emb
+        q_emb = self.norm_ffn(residual + self.ffn(q_emb)) * query_mask
+
+        return q_emb, k_emb, v_emb, mask, local_mask
 
 
-class Refiner(nn.Module):
+class VisualRefiner(nn.Module):
     def __init__(
         self,
         vocab_size: int,
         visual_dim: int = 512,
         attn_dim: int = 512,
+        attn_head: int = 8,
+        ffn_dim: int = 2048,
+        num_blocks: int = 1,
+        window_size: int = 3,
         blank_id: int = 0,
         reduce_ratio: float = 0.5,
+        conv_kernel: int = 3,
+        bias: bool = False,
+        activation: str = "gelu",
+        attn_dropout: float = 0.0,
+        dropout: float = 0.1,
     ):
         super().__init__()
+
+        assert conv_kernel > 0 and conv_kernel % 2 == 1
+        assert num_blocks > 0
+        assert window_size > 0 and window_size % 2 == 1
+
         self.blank_id = blank_id
         self.reduce_ratio = reduce_ratio
+        self.window_size = window_size // 2
 
-        self.visual_proj = nn.Linear(visual_dim, attn_dim)
-        self.posterior_proj = nn.Linear(vocab_size, attn_dim)
-        self.fusion = nn.Linear(2 * attn_dim, attn_dim)
+        self.logits_proj = nn.Linear(vocab_size, attn_dim, bias=bias)
+        self.posterior_proj = nn.Linear(vocab_size, attn_dim, bias=bias)
+        self.visual_proj = nn.Linear(visual_dim, attn_dim, bias=bias)
 
-        self.norm_k = LayerNorm(attn_dim)
-        self.norm_v = LayerNorm(attn_dim)
+        self.dwconv = nn.Sequential(
+            nn.Conv1d(
+                attn_dim,
+                attn_dim,
+                kernel_size=conv_kernel,
+                padding=conv_kernel // 2,
+                groups=attn_dim,
+                bias=bias,
+            ),
+            nn.GELU() if activation == "gelu" else nn.LeakyReLU(),
+            nn.Dropout(dropout),
+        )
 
-    def forward(
-        self,
-        logits: torch.Tensor,
-        visual_feats: torch.Tensor,
-        video_lengths,
-        return_attn: bool = False,
-    ):
+        self.visual_norm = LayerNorm(attn_dim)
+
+        self.layers = repeat(
+            num_blocks,
+            lambda _: RefinerLayer(
+                attn_dim=attn_dim,
+                attn_head=attn_head,
+                ffn_dim=ffn_dim,
+                attn_dropout=attn_dropout,
+                dropout=dropout,
+            ),
+        )
+
+        self.final_head = nn.Sequential(
+            nn.Linear(2 * attn_dim, attn_dim),
+            LayerNorm(attn_dim),
+            nn.GELU() if activation == "gelu" else nn.LeakyReLU(),
+            nn.Dropout(dropout),
+        )
+
+    def make_local_mask(self, time: int, device):
+        positions = torch.arange(time, device=device)
+
+        return (positions.unsqueeze(1) - positions.unsqueeze(0)).abs() > self.window_size
+
+    def forward(self, logits: torch.Tensor, visual_feats: torch.Tensor, video_lengths):
         logits = logits.detach()
+        visual_feats = visual_feats.detach()
+
+        if logits.shape[:2] != visual_feats.shape[:2]:
+            raise ValueError(
+                "Logits and visual features must have the same batch and time dimensions."
+            )
 
         with torch.no_grad():
             p_old = logits.softmax(dim=-1)
@@ -263,10 +162,23 @@ class Refiner(nn.Module):
 
         valid_mask = make_non_pad_mask(video_lengths).to(
             device=logits.device, dtype=torch.bool
-        )  # [B,T]
+        )
+        local_mask = self.make_local_mask(logits.size(1), logits.device)
 
-        posterior_emb = self.posterior_proj(p_soft)
-        visual_emb = self.visual_proj(visual_feats)
+        logits_emb = self.logits_proj(logits)  # [B,T,D]
+        posterior_emb = self.posterior_proj(p_soft)  # [B,T,D]
 
-        k = self.norm_k(self.fusion(torch.cat([posterior_emb, visual_emb], dim=-1)))
-        v = self.norm_v(visual_emb)
+        visual_emb = self.visual_proj(visual_feats)  # [B,T,D]
+
+        visual_ctx = self.dwconv(visual_emb.transpose(1, 2)).transpose(
+            1, 2
+        )  # [B,T,D] -> [B,D,T] -> [B, D, T]
+        visual_ctx = self.visual_norm(visual_emb + visual_ctx)
+
+        hidden, _, _, _, _ = self.layers(
+            posterior_emb, visual_ctx, visual_emb, valid_mask, local_mask
+        )
+
+        logits = self.final_head(torch.cat([logits_emb, hidden], dim=-1))
+
+        return {"logits": logits, "inner_logits": hidden}

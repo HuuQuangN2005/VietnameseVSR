@@ -8,6 +8,7 @@ from srcs.nets.backend.ctc import CTC
 from srcs.nets.backend.encoder.conformer_encoder import ConformerEncoder
 from srcs.nets.backend.frontend.resnet import video_resnet
 from srcs.nets.backend.nets_utils import make_non_pad_mask
+from srcs.nets.backend.refiner.refiner import VisualRefiner
 from srcs.nets.utils import ctc_decode, freeze
 
 
@@ -111,6 +112,82 @@ class VSRModel(nn.Module):
     def decode(self, videos, video_lengths):
         output = self(videos, video_lengths)
         return ctc_decode(output["logits"], output["input_lengths"], self.blank_id)
+
+
+class VSRRefinerModel(nn.Module):
+    def __init__(
+        self,
+        base_model: VSRModel,
+        vocab_size: int,
+        attn_dim: int = 512,
+        inner_ctc_weight: float = 0.3,
+        **refiner_config,
+    ):
+        super().__init__()
+
+        if not 0.0 <= inner_ctc_weight <= 1.0:
+            raise ValueError("inner_ctc_weight must be between 0 and 1.")
+
+        self.base_model = base_model
+        self.refiner = VisualRefiner(
+            vocab_size=vocab_size,
+            attn_dim=attn_dim,
+            blank_id=base_model.blank_id,
+            **refiner_config,
+        )
+        self.inner_ctc = CTC(
+            output_size=vocab_size,
+            input_size=attn_dim,
+            blank_id=base_model.blank_id,
+            ignore_id=base_model.ctc.ignore_id,
+        )
+        self.final_ctc = CTC(
+            output_size=vocab_size,
+            input_size=attn_dim,
+            blank_id=base_model.blank_id,
+            ignore_id=base_model.ctc.ignore_id,
+        )
+        self.inner_ctc_weight = inner_ctc_weight
+
+        freeze(self.base_model)
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.base_model.eval()
+        return self
+
+    def forward(self, videos, video_lengths, labels=None, label_lengths=None):
+        with torch.no_grad():
+            contexts = self.base_model.get_contexts(videos, video_lengths)
+
+        outputs = self.refiner(
+            contexts["logits"], contexts["visual_features"], contexts["input_lengths"]
+        )
+
+        inner_loss, _ = self.inner_ctc(
+            outputs["inner_logits"], contexts["input_lengths"], labels, label_lengths
+        )
+        final_loss, final_logits = self.final_ctc(
+            outputs["logits"], contexts["input_lengths"], labels, label_lengths
+        )
+
+        loss = None
+        if final_loss is not None:
+            loss = (
+                1.0 - self.inner_ctc_weight
+            ) * final_loss + self.inner_ctc_weight * inner_loss
+
+        return {
+            "loss": loss,
+            "logits": final_logits,
+            "input_lengths": contexts["input_lengths"],
+        }
+
+    def decode(self, videos, video_lengths):
+        output = self(videos, video_lengths)
+        return ctc_decode(
+            output["logits"], output["input_lengths"], self.base_model.blank_id
+        )
 
 
 def get_model(model: str, vocab_size: int, size: str = "large", **model_config):
