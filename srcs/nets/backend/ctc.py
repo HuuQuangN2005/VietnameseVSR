@@ -2,6 +2,7 @@
 # License: Apache-2.0 (https://github.com/mpc001/auto_avsr/blob/main/LICENSE)
 
 import torch
+import torch.nn as nn
 
 
 class CTC(torch.nn.Module):

@@ -1,4 +1,8 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from srcs.nets.backend.transformer.layer_norm import LayerNorm
 
 
 def make_soft_blank_posterior(

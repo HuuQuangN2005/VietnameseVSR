@@ -6,7 +6,7 @@ import yaml
 from transformers import EarlyStoppingCallback, TrainingArguments
 
 from srcs.datasets.vicocktail import Collator, load_vicocktail
-from srcs.nets.e2e import VSRRefinerModel, get_model as create_model
+from srcs.nets.e2e import VSRRefinerModel, VSRRefinerModelV2, get_model as create_model
 from srcs.nets.utils import load_weights
 from srcs.spm.spm_train import ensure_unigram
 from srcs.spm.text_transofm import TextTransform
@@ -39,7 +39,7 @@ def load_model(vocab_size, checkpoint_path, inner_ctc_weight):
     base_model = create_model("auto-vsr", vocab_size, size="large")
     load_weights(base_model, checkpoint_path)
 
-    return VSRRefinerModel(
+    return VSRRefinerModelV2(
         base_model=base_model, vocab_size=vocab_size, inner_ctc_weight=inner_ctc_weight
     )
 
