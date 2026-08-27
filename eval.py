@@ -1,78 +1,74 @@
 import argparse
+import os
 
-import torch
-from transformers import TrainingArguments
-
-from srcs.datasets.vicocktail import Collator, load_vicocktail
-from srcs.nets.e2e import get_model as create_model
-from srcs.nets.utils import load_weights
+from srcs.datasets.vicocktail import load_vicocktail
+from srcs.nets.e2e import get_model
 from srcs.spm.spm_train import ensure_unigram
 from srcs.spm.text_transofm import TextTransform
-from srcs.trainer.trainer import HFTrainer, build_metric_fn, preprocess_logits_for_metrics
-from train import CONFIG_PATH, load_config
+from srcs.trainer.trainer import RefinerTrainer
+from srcs.trainer.utils import create_dataloader, load_config
+from train import CONFIG_PATH
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=CONFIG_PATH)
-    parser.add_argument("--model", choices=("auto-vsr",), default="auto-vsr")
-    parser.add_argument("--size", choices=("large", "small"), default="large")
+    parser.add_argument("--vsr_checkpoint", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--test_fraction", type=float, default=1.0)
-
     return parser.parse_args()
-
-
-def get_model(args, text_transform):
-    model = create_model(args.model, text_transform.vocab_size, size=args.size)
-
-    report = load_weights(model, args.checkpoint)
-
-    print(f"Loaded model checkpoint: {report['loaded']} tensors.")
-
-    return model
-
-
-def get_evaluation_args(config):
-    return TrainingArguments(
-        output_dir="checkpoints",
-        label_names=["labels", "label_lengths"],
-        per_device_eval_batch_size=config["batch_size"],
-        fp16=torch.cuda.is_available(),
-        remove_unused_columns=False,
-        dataloader_num_workers=config["num_workers"],
-        dataloader_pin_memory=torch.cuda.is_available(),
-        dataloader_persistent_workers=config["num_workers"] > 0,
-        dataloader_prefetch_factor=2 if config["num_workers"] > 0 else None,
-    )
 
 
 def main():
     args = parse_args()
     config = load_config(args.config)
     evaluation_config = config["evaluation"]
-    test_dataset = load_vicocktail(test_fraction=args.test_fraction, splits=("test",))[
-        "test"
-    ]
+    seed = config["training"]["seed"]
+
+    test_dataset = load_vicocktail(
+        test_fraction=args.test_fraction,
+        splits=("test",),
+        seed=seed,
+    )["test"]
     model_path, units_path = ensure_unigram()
     text_transform = TextTransform(model_path, units_path)
-    model = get_model(args, text_transform)
-    test_collator = Collator(text_transform, "test")
 
-    trainer = HFTrainer(
-        model=model,
-        args=get_evaluation_args(evaluation_config),
-        train_dataset=None,
-        eval_dataset=test_dataset,
-        train_collator=test_collator,
-        validation_collator=test_collator,
-        compute_metrics=build_metric_fn(text_transform),
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+    base_model = get_model(
+        "auto-vsr",
+        text_transform.vocab_size,
+        checkpoint=args.vsr_checkpoint,
     )
-    output = trainer.predict(test_dataset)
+    refiner = get_model(
+        "refiner",
+        text_transform.vocab_size,
+        checkpoint=args.checkpoint,
+        blank_id=text_transform.blank_id,
+        ignore_id=text_transform.ignore_id,
+    )
 
+    dataloader = create_dataloader(
+        test_dataset,
+        text_transform,
+        "test",
+        evaluation_config,
+    )
+    trainer = RefinerTrainer(
+        base_model,
+        refiner,
+        optimizer=None,
+        scheduler=None,
+        scaler=None,
+        text_transform=text_transform,
+        config=evaluation_config,
+        amp=evaluation_config.get("amp", True),
+    )
+    metrics = trainer.run_one_epoch(dataloader, training=False, description="Testing")
+
+    print(f"VSR checkpoint: {os.path.abspath(args.vsr_checkpoint)}")
+    print(f"Refiner checkpoint: {os.path.abspath(args.checkpoint)}")
     print(f"Test samples: {len(test_dataset)}")
-    trainer.log_metrics("test", output.metrics)
+    print(f"Test loss: {metrics['loss']:.6f}")
+    print(f"Test WER: {metrics['wer']:.6f}")
 
 
 if __name__ == "__main__":

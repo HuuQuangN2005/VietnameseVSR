@@ -4,29 +4,7 @@ import torch
 from safetensors.torch import load_file
 
 
-def _state(checkpoint):
-
-    if not isinstance(checkpoint, dict):
-        raise TypeError("Checkpoint must contain a state dictionary.")
-
-    for key in ("model_state_dict", "state_dict", "model"):
-        if key in checkpoint and isinstance(checkpoint[key], dict):
-            return checkpoint[key]
-
-    return checkpoint
-
-
-def _strip(key):
-
-    for prefix in ("module.", "model."):
-        if key.startswith(prefix):
-            key = key[len(prefix) :]
-
-    return key
-
-
 def _weight_path(path):
-
     if os.path.isfile(path):
         return path
 
@@ -40,76 +18,39 @@ def _weight_path(path):
     raise FileNotFoundError(f"Weights not found: {path}")
 
 
-def load_weights(model, path):
-    if not path:
-        raise FileNotFoundError(f"Weights not found: {path}")
-
+def _load_state(path):
     path = _weight_path(path)
 
     if path.endswith(".safetensors"):
-        checkpoint = load_file(path, device="cpu")
+        state = load_file(path, device="cpu")
     else:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        state = torch.load(path, map_location="cpu", weights_only=False)
 
-    source_state = {_strip(key): value for key, value in _state(checkpoint).items()}
-    try:
-        model.load_state_dict(source_state, strict=True)
-    except RuntimeError as error:
-        raise RuntimeError(
-            f"Checkpoint is incompatible with model: {path}\n{error}"
-        ) from error
-
-    return {"loaded": len(source_state)}
-
-
-def load_backbone_weights(model, path):
-    path = _weight_path(path)
-
-    if path.endswith(".safetensors"):
-        checkpoint = load_file(path, device="cpu")
-    else:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-
-    source_state = {_strip(key): value for key, value in _state(checkpoint).items()}
-    target_state = model.state_dict()
-    prefixes = ("frontend.", "proj_encoder.", "encoder.")
-    loaded = {}
-    skipped = []
-    shape_mismatch = []
-
-    for key, value in source_state.items():
-        if not key.startswith(prefixes):
-            skipped.append(key)
-        elif key not in target_state:
-            skipped.append(key)
-        elif target_state[key].shape != value.shape:
-            shape_mismatch.append(
-                {
-                    "key": key,
-                    "source": tuple(value.shape),
-                    "target": tuple(target_state[key].shape),
-                }
-            )
-        else:
-            loaded[key] = value
-
-    backbone_keys = [key for key in target_state if key.startswith(prefixes)]
-    missing = [key for key in backbone_keys if key not in loaded]
-
-    if missing or shape_mismatch:
-        raise RuntimeError(
-            "Auto-AVSR backbone is incompatible: "
-            f"{len(missing)} missing and {len(shape_mismatch)} shape mismatches."
-        )
-
-    model.load_state_dict(loaded, strict=False)
+    for key in ("model_state_dict", "state_dict", "model"):
+        if key in state:
+            state = state[key]
+            break
 
     return {
-        "loaded": list(loaded),
-        "missing": missing,
-        "shape_mismatch": shape_mismatch,
-        "skipped": skipped,
+        key.removeprefix("module.").removeprefix("model."): value
+        for key, value in state.items()
     }
+
+
+def load_weights(model, path):
+    state = _load_state(path)
+    target = model.state_dict()
+    state = {
+        key: value
+        for key, value in state.items()
+        if key in target and value.shape == target[key].shape
+    }
+    missing = [key for key in target if key not in state]
+
+    if not state or any(not key.startswith("ctc.") for key in missing):
+        raise RuntimeError(f"No compatible weights found: {path}")
+
+    model.load_state_dict(state, strict=False)
 
 
 def freeze(module):
@@ -117,40 +58,3 @@ def freeze(module):
         param.requires_grad = False
 
     module.eval()
-
-
-def parameter_count(model, trainable=False):
-    params = model.parameters()
-
-    if trainable:
-        params = (param for param in params if param.requires_grad)
-
-    return sum(param.numel() for param in params)
-
-
-def ctc_decode(outputs, input_lengths=None, blank_id=0):
-
-    if outputs.ndim == 3:
-        frame_ids = outputs.argmax(-1)
-    elif outputs.ndim == 2:
-        frame_ids = outputs
-    else:
-        raise ValueError("outputs must have shape (batch, time, vocab) or (batch, time)")
-
-    if input_lengths is None:
-        input_lengths = torch.full(
-            (frame_ids.size(0),),
-            frame_ids.size(1),
-            dtype=torch.long,
-            device=frame_ids.device,
-        )
-
-    frame_ids = frame_ids.detach().cpu()
-    input_lengths = input_lengths.detach().cpu()
-    decoded_tokens = []
-
-    for token_ids, length in zip(frame_ids, input_lengths.tolist()):
-        token_ids = torch.unique_consecutive(token_ids[: int(length)])
-        decoded_tokens.append(token_ids[token_ids.ne(blank_id)].tolist())
-
-    return decoded_tokens

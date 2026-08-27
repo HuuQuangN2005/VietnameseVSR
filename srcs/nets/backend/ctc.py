@@ -2,7 +2,33 @@
 # License: Apache-2.0 (https://github.com/mpc001/auto_avsr/blob/main/LICENSE)
 
 import torch
-import torch.nn as nn
+
+
+def ctc_decode(outputs, input_lengths=None, blank_id=0):
+    if outputs.ndim == 3:
+        frame_ids = outputs.argmax(-1)
+    elif outputs.ndim == 2:
+        frame_ids = outputs
+    else:
+        raise ValueError("outputs must have shape (batch, time, vocab) or (batch, time)")
+
+    if input_lengths is None:
+        input_lengths = torch.full(
+            (frame_ids.size(0),),
+            frame_ids.size(1),
+            dtype=torch.long,
+            device=frame_ids.device,
+        )
+
+    frame_ids = frame_ids.detach().cpu()
+    input_lengths = input_lengths.detach().cpu()
+    decoded_tokens = []
+
+    for token_ids, length in zip(frame_ids, input_lengths.tolist()):
+        token_ids = torch.unique_consecutive(token_ids[: int(length)])
+        decoded_tokens.append(token_ids[token_ids.ne(blank_id)].tolist())
+
+    return decoded_tokens
 
 
 class CTC(torch.nn.Module):
@@ -22,7 +48,9 @@ class CTC(torch.nn.Module):
         self.ctc_lo = torch.nn.Linear(input_size, output_size)
         self.dropout = torch.nn.Dropout(dropout_rate)
         self.ctc_loss = torch.nn.CTCLoss(
-            blank=blank_id, reduction="sum" if reduce else "none", zero_infinity=True
+            blank=blank_id,
+            reduction="sum" if reduce else "none",
+            zero_infinity=True,
         )
 
     def forward(self, encoded_features, input_lengths, labels=None, label_lengths=None):
@@ -52,7 +80,7 @@ class CTC(torch.nn.Module):
         # label_mask: [B, L], label_lengths: [B]
         targets = labels.masked_select(label_mask)
         # targets: [sum(label_lengths)]
-        log_probs = logits.log_softmax(dim=-1).transpose(0, 1)
+        log_probs = logits.float().log_softmax(dim=-1).transpose(0, 1)
         # log_probs: [T, B, V]
         use_reduce = self.reduce if reduce is None else reduce
 

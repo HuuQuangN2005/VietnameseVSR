@@ -1,134 +1,296 @@
-# Source (modified): https://github.com/nguyenvulebinh/AVSRCocktail/blob/main/src/custom_trainer.py
-# License: CC BY-NC 4.0 (https://github.com/nguyenvulebinh/AVSRCocktail/blob/main/LICENSE)
-
-from contextlib import contextmanager
+import os
 
 import torch
 from torchmetrics.text import WordErrorRate
+from tqdm.auto import tqdm
 
-from transformers import Trainer, TrainingArguments
-from transformers.trainer_pt_utils import LengthGroupedSampler
+from srcs.nets.utils import freeze
+from srcs.trainer.utils import (
+    create_cosine_scheduler,
+    create_grad_scaler,
+    move_batch,
+    optimizer_step_count,
+    save_checkpoint,
+    save_history,
+    update_wer,
+)
 
-from srcs.nets.utils import ctc_decode
 
-
-class HFTrainer(Trainer):
+class Trainer:
     def __init__(
-        self,
-        model,
-        args: TrainingArguments,
-        train_dataset,
-        eval_dataset,
-        train_collator,
-        validation_collator,
-        compute_metrics=None,
-        preprocess_logits_for_metrics=None,
-        callbacks=None,
+        self, model, optimizer, scheduler, scaler, text_transform, config, amp=True
     ):
-        if validation_collator is None:
-            raise ValueError("validation_collator must be provided.")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.scaler = scaler
+        self.text_transform = text_transform
+        self.config = config
+        self.amp = amp
+        self.model = model.to(self.device)
 
-        super().__init__(
-            model=model,
-            args=args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            data_collator=train_collator,
-            compute_metrics=compute_metrics,
-            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-            callbacks=callbacks,
-        )
-
-        if self.args.remove_unused_columns:
-            raise ValueError("remove_unused_columns must be False.")
-
-        self.validation_collator = validation_collator
-
-    def _get_train_sampler(self, train_dataset=None):
-        dataset = self.train_dataset if train_dataset is None else train_dataset
-        length_column = self.args.length_column_name
-
-        if (
-            self.args.train_sampling_strategy != "group_by_length"
-            or dataset is None
-            or not hasattr(dataset, "column_names")
-            or length_column not in dataset.column_names
-        ):
-            return super()._get_train_sampler(train_dataset)
-
-        lengths = [int(length) for length in dataset[length_column]]
-
-        return LengthGroupedSampler(
-            self.args.train_batch_size * self.args.gradient_accumulation_steps,
-            lengths=lengths,
-        )
-
-    @contextmanager
-    def _use_validation_collator(self):
-        current_collator = self.data_collator
-        self.data_collator = self.validation_collator
-
-        try:
-            yield
-        finally:
-            self.data_collator = current_collator
-
-    def get_eval_dataloader(self, eval_dataset=None):
-        with self._use_validation_collator():
-            return super().get_eval_dataloader(eval_dataset)
-
-    def get_test_dataloader(self, test_dataset):
-        with self._use_validation_collator():
-            return super().get_test_dataloader(test_dataset)
-
-
-class FinetuneTrainer(HFTrainer):
-    def __init__(self, *args, encoder_lr, ctc_head_lr, **kwargs):
-        self.encoder_lr = encoder_lr
-        self.ctc_head_lr = ctc_head_lr
-        super().__init__(*args, **kwargs)
-
-    def create_optimizer(self, model=None):
-        if self.optimizer is not None:
-            return self.optimizer
-
-        model = self.model if model is None else model
-        encoder_parameters = list(model.encoder.encoders[-2:].parameters())
-        ctc_head_parameters = list(model.ctc.ctc_lo.parameters())
-
-        self.optimizer = torch.optim.AdamW(
-            [
-                {"params": encoder_parameters, "lr": self.encoder_lr},
-                {"params": ctc_head_parameters, "lr": self.ctc_head_lr},
-            ],
-            betas=(self.args.adam_beta1, self.args.adam_beta2),
-            eps=self.args.adam_epsilon,
-            weight_decay=self.args.weight_decay,
-        )
-        return self.optimizer
-
-
-def preprocess_logits_for_metrics(logits, labels):
-    del labels
-    logits, input_lengths = logits
-    return logits.argmax(dim=-1), input_lengths
-
-
-def build_metric_fn(text_transform):
-    def compute(eval_pred):
-        frame_ids, input_lengths = eval_pred.predictions
-        token_ids = ctc_decode(
-            torch.as_tensor(frame_ids),
-            torch.as_tensor(input_lengths),
-            text_transform.blank_id,
-        )
-        labels, label_lengths = eval_pred.label_ids
-        hypotheses = [text_transform.decode(item) for item in token_ids]
-        references = [
-            text_transform.decode(label[: int(length)])
-            for label, length in zip(labels, label_lengths)
+    def build_optimizer(self):
+        parameters = [
+            parameter for parameter in self.model.parameters() if parameter.requires_grad
         ]
+        if not parameters:
+            raise ValueError("The model does not contain trainable parameters.")
 
-        return {"wer": WordErrorRate()(hypotheses, references).item()}
+        return torch.optim.AdamW(
+            parameters,
+            lr=self.config["learning_rate"],
+            weight_decay=self.config.get("weight_decay", 0.0),
+        )
 
-    return compute
+    def build_scheduler(self, train_dataloader, epochs):
+        total_steps = optimizer_step_count(
+            train_dataloader, epochs, self.config.get("gradient_accumulation_steps", 1)
+        )
+        return create_cosine_scheduler(
+            self.optimizer, total_steps, self.config.get("warmup_steps", 0)
+        )
+
+    def setup_training(self, train_dataloader, epochs):
+        if self.optimizer is None:
+            self.optimizer = self.build_optimizer()
+
+        if self.scheduler is None:
+            self.scheduler = self.build_scheduler(train_dataloader, epochs)
+
+        if self.scaler is None:
+            self.scaler = create_grad_scaler(self.device, self.amp)
+
+    def _forward(self, batch):
+        return self.model(**batch)
+
+    def set_model_mode(self, training):
+        self.model.train(training)
+
+    def _run_one_epoch(self, dataloader, training, description, forward):
+        amp_enabled = self.amp and self.device.type == "cuda"
+
+        accumulation_steps = self.config.get("gradient_accumulation_steps", 1)
+        max_grad_norm = self.config.get("max_grad_norm", 0.0)
+        logging_steps = self.config.get("logging_steps", 25)
+
+        if training and self.optimizer is None:
+            raise ValueError("An optimizer is required for training.")
+
+        if training and amp_enabled and self.scaler is None:
+            raise ValueError("A GradScaler is required when AMP is enabled.")
+
+        if accumulation_steps <= 0:
+            raise ValueError("gradient_accumulation_steps must be greater than zero.")
+
+        if logging_steps <= 0:
+            raise ValueError("logging_steps must be greater than zero.")
+
+        if len(dataloader) == 0:
+            raise ValueError("The dataloader must contain at least one batch.")
+
+        self.set_model_mode(training)
+
+        if training:
+            self.optimizer.zero_grad(set_to_none=True)
+
+        sample_count = 0
+        loss_sum = 0.0
+
+        wer = WordErrorRate()
+
+        progress = tqdm(enumerate(dataloader), total=len(dataloader), desc=description)
+        grad_context = torch.enable_grad if training else torch.inference_mode
+
+        with grad_context():
+            for step, batch in progress:
+                batch = move_batch(batch, self.device)
+
+                with torch.amp.autocast(
+                    device_type=self.device.type, dtype=torch.float16, enabled=amp_enabled
+                ):
+                    outputs = forward(batch)
+                    loss = outputs["loss"]
+
+                if loss is None:
+                    raise RuntimeError("The model did not return a loss.")
+
+                if training:
+                    group_start = (step // accumulation_steps) * accumulation_steps
+                    group_size = min(accumulation_steps, len(dataloader) - group_start)
+
+                    scaled_loss = loss / group_size
+
+                    if amp_enabled:
+                        self.scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+
+                    should_update = (
+                        step + 1
+                    ) % accumulation_steps == 0 or step + 1 == len(dataloader)
+
+                    if should_update:
+                        optimizer_updated = True
+
+                        if amp_enabled:
+                            self.scaler.unscale_(self.optimizer)
+
+                        if max_grad_norm > 0.0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), max_grad_norm
+                            )
+
+                        if amp_enabled:
+                            previous_scale = self.scaler.get_scale()
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                            optimizer_updated = self.scaler.get_scale() >= previous_scale
+                        else:
+                            self.optimizer.step()
+
+                        self.optimizer.zero_grad(set_to_none=True)
+
+                        if self.scheduler is not None and optimizer_updated:
+                            self.scheduler.step()
+
+                batch_size = batch["videos"].size(0)
+                loss_sum += loss.detach().float().item() * batch_size
+                sample_count += batch_size
+
+                update_wer(wer, outputs, batch, self.text_transform)
+
+                if (step + 1) % logging_steps == 0 or step + 1 == len(dataloader):
+                    postfix = {
+                        "loss": f"{loss_sum / sample_count:.4f}",
+                        "wer": f"{wer.compute().item():.4f}",
+                    }
+                    if training:
+                        postfix["lr"] = f"{self.optimizer.param_groups[0]['lr']:.2e}"
+                    progress.set_postfix(postfix)
+
+        return {"loss": loss_sum / sample_count, "wer": wer.compute().item()}
+
+    def run_one_epoch(self, dataloader, training, description):
+        return self._run_one_epoch(dataloader, training, description, self._forward)
+
+    def train(self, train_dataloader, validation_dataloader, epochs, output_dir):
+        if epochs <= 0:
+            raise ValueError("epochs must be greater than zero.")
+
+        self.setup_training(train_dataloader, epochs)
+        os.makedirs(output_dir, exist_ok=True)
+
+        best_path = os.path.join(output_dir, "best.pt")
+        last_path = os.path.join(output_dir, "last.pt")
+        history_path = os.path.join(output_dir, "history.json")
+
+        best_wer = float("inf")
+        stale_epochs = 0
+        history = []
+
+        for epoch in tqdm(range(1, epochs + 1), desc="Epochs"):
+            train_metrics = self.run_one_epoch(
+                train_dataloader, training=True, description="Training"
+            )
+            validation_metrics = self.run_one_epoch(
+                validation_dataloader, training=False, description="Validation"
+            )
+
+            epoch_metrics = {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "train_wer": train_metrics["wer"],
+                "validation_loss": validation_metrics["loss"],
+                "validation_wer": validation_metrics["wer"],
+            }
+
+            history.append(epoch_metrics)
+
+            save_history(history, history_path)
+            save_checkpoint(self.model, last_path, epoch, epoch_metrics)
+
+            improved = validation_metrics["wer"] < (
+                best_wer - self.config["early_stopping_threshold"]
+            )
+            if improved:
+                best_wer = validation_metrics["wer"]
+                stale_epochs = 0
+
+                save_checkpoint(self.model, best_path, epoch, epoch_metrics)
+
+            else:
+                stale_epochs += 1
+
+            if stale_epochs >= self.config["early_stopping_patience"]:
+                break
+
+        return history
+
+
+class FinetuneTrainer(Trainer):
+    def __init__(self, model, *args, **kwargs):
+        freeze(model)
+        blocks = model.encoder.encoders
+        blocks[-2:].requires_grad_(True)
+        model.ctc.ctc_lo.requires_grad_(True)
+
+        self.frozen_modules = [
+            model.frontend,
+            model.proj_encoder,
+            model.encoder.embed,
+            *blocks[:-2],
+            model.encoder.after_norm,
+        ]
+        super().__init__(model, *args, **kwargs)
+
+    def set_model_mode(self, training):
+        self.model.train(training)
+
+        for module in self.frozen_modules:
+            module.eval()
+
+    def build_optimizer(self):
+        return torch.optim.AdamW(
+            [
+                {
+                    "params": self.model.encoder.encoders[-2:].parameters(),
+                    "lr": self.config["encoder_lr"],
+                },
+                {
+                    "params": self.model.ctc.ctc_lo.parameters(),
+                    "lr": self.config["ctc_head_lr"],
+                },
+            ],
+            weight_decay=self.config.get("weight_decay", 0.0),
+        )
+
+
+class RefinerTrainer(Trainer):
+    def __init__(self, base_model, refiner, *args, transform=None, **kwargs):
+        super().__init__(refiner, *args, **kwargs)
+
+        self.base_model = base_model
+        freeze(self.base_model)
+        self.base_model.to(self.device)
+        self.transform = transform
+
+    def _forward_refiner(self, batch):
+        logits, visual_contexts = self.base_model.get_contexts(
+            batch["videos"], batch["video_lengths"]
+        )
+
+        if self.transform is not None and self.model.training:
+            visual_contexts = self.transform(visual_contexts)
+
+        return self.model(
+            logits,
+            visual_contexts,
+            labels=batch.get("labels"),
+            label_lengths=batch.get("label_lengths"),
+        )
+
+    def run_one_epoch(self, dataloader, training, description):
+        self.base_model.eval()
+        return self._run_one_epoch(
+            dataloader, training, description, self._forward_refiner
+        )

@@ -1,124 +1,78 @@
 import argparse
 import os
-import torch
-import yaml
 
-from transformers import EarlyStoppingCallback, TrainingArguments
-from srcs.datasets.vicocktail import Collator, load_vicocktail
-from srcs.nets.e2e import get_model as create_model
+from srcs.datasets.vicocktail import load_vicocktail
+from srcs.nets.backend.refiner.transform import RefinerTransform
+from srcs.nets.e2e import get_model
 from srcs.spm.spm_train import ensure_unigram
 from srcs.spm.text_transofm import TextTransform
-from srcs.trainer.trainer import HFTrainer, build_metric_fn, preprocess_logits_for_metrics
+from srcs.trainer.trainer import RefinerTrainer
+from srcs.trainer.utils import create_dataloader, load_config, set_seed
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
-
-
-def load_config(path):
-    with open(path, encoding="utf-8") as file:
-        return yaml.safe_load(file)
-
-
-def get_model(args, text_transform):
-    return create_model(args.model, text_transform.vocab_size, size=args.size)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.yaml")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "checkpoints", "refiner")
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=CONFIG_PATH)
-    parser.add_argument("--model", choices=("auto-vsr",), default="auto-vsr")
-    parser.add_argument("--size", choices=("large", "small"), default="large")
-    parser.add_argument("--output_dir", default="/checkpoints")
+    parser.add_argument("--vsr_checkpoint", required=True)
+    parser.add_argument("--output_dir", default=OUTPUT_DIR)
     parser.add_argument("--train_fraction", type=float, default=1.0)
     parser.add_argument("--val_fraction", type=float, default=1.0)
     parser.add_argument("--epochs", type=int, default=40)
     return parser.parse_args()
 
 
-def get_training_args(args, config):
-    return TrainingArguments(
-        output_dir=args.output_dir,
-        label_names=["labels", "label_lengths"],
-        per_device_train_batch_size=config["batch_size"],
-        per_device_eval_batch_size=config["batch_size"],
-        num_train_epochs=args.epochs,
-        gradient_accumulation_steps=config["gradient_accumulation_steps"],
-        learning_rate=config["learning_rate"],
-        weight_decay=config["weight_decay"],
-        warmup_steps=config["warmup_steps"],
-        max_grad_norm=config["max_grad_norm"],
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        logging_strategy="steps",
-        logging_steps=config["logging_steps"],
-        fp16=torch.cuda.is_available(),
-        remove_unused_columns=False,
-        dataloader_num_workers=config["num_workers"],
-        dataloader_pin_memory=torch.cuda.is_available(),
-        dataloader_persistent_workers=config["num_workers"] > 0,
-        dataloader_prefetch_factor=2 if config["num_workers"] > 0 else None,
-        train_sampling_strategy="group_by_length",
-        length_column_name="video_length",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_wer",
-        greater_is_better=False,
-        save_total_limit=config["save_total_limit"],
-        seed=config["seed"],
-        data_seed=config["seed"],
-    )
-
-
 def main():
     args = parse_args()
-    print(f"Config: {os.path.abspath(args.config)}")
-    config = load_config(args.config)
-    training_config = config["training"]
-    torch.manual_seed(training_config["seed"])
+    config = load_config(args.config)["training"]
+    set_seed(config["seed"])
 
-    dataset_splits = load_vicocktail(
+    datasets = load_vicocktail(
         train_fraction=args.train_fraction,
         validation_fraction=args.val_fraction,
         splits=("train", "val"),
+        seed=config["seed"],
     )
+    train_dataset = datasets["train"]
+    validation_dataset = datasets["val"]
 
-    model_path, units_path = ensure_unigram(dataset_splits["train"])
+    model_path, units_path = ensure_unigram(train_dataset)
     text_transform = TextTransform(model_path, units_path)
-    model = get_model(args, text_transform)
-
-    trainer = HFTrainer(
-        model=model,
-        args=get_training_args(args, training_config),
-        train_dataset=dataset_splits["train"],
-        eval_dataset=dataset_splits["val"],
-        train_collator=Collator(text_transform, "train"),
-        validation_collator=Collator(text_transform, "val"),
-        compute_metrics=build_metric_fn(text_transform),
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        callbacks=[
-            EarlyStoppingCallback(
-                early_stopping_patience=training_config["early_stopping_patience"],
-                early_stopping_threshold=training_config["early_stopping_threshold"],
-            )
-        ],
+    base_model = get_model(
+        "auto-vsr", text_transform.vocab_size, checkpoint=args.vsr_checkpoint
+    )
+    model = get_model(
+        "refiner",
+        text_transform.vocab_size,
+        blank_id=text_transform.blank_id,
+        ignore_id=text_transform.ignore_id,
     )
 
-    trainer.train()
-    final_dir = os.path.join(args.output_dir, "final")
+    train_dataloader = create_dataloader(
+        train_dataset, text_transform, "train", config, shuffle=True
+    )
+    validation_dataloader = create_dataloader(
+        validation_dataset, text_transform, "val", config
+    )
 
-    trainer.save_model(final_dir)
-    trainer.save_state()
+    amp = config.get("amp", True)
+    transform = RefinerTransform(probability=0.1)
 
-    if trainer.is_world_process_zero():
-        completed_epoch = trainer.state.epoch or 0.0
-        stopped_early = completed_epoch + 1e-6 < args.epochs
-        status = "Early stopping" if stopped_early else "Training completed"
-
-        print(f"{status} at epoch {completed_epoch:g}")
-
-        if trainer.state.best_metric is not None:
-            print(f"Best validation WER: {trainer.state.best_metric:.6f}")
-
-        print(f"Best checkpoint: {trainer.state.best_model_checkpoint}")
-        print(f"Final model: {final_dir}")
+    trainer = RefinerTrainer(
+        base_model,
+        model,
+        optimizer=None,
+        scheduler=None,
+        scaler=None,
+        text_transform=text_transform,
+        config=config,
+        amp=amp,
+        transform=transform,
+    )
+    trainer.train(train_dataloader, validation_dataloader, args.epochs, args.output_dir)
 
 
 if __name__ == "__main__":
