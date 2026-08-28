@@ -97,6 +97,8 @@ class Trainer:
         loss_sum = 0.0
 
         wer = WordErrorRate()
+        baseline_wer = WordErrorRate() if not training else None
+        has_baseline = False
 
         progress = tqdm(enumerate(dataloader), total=len(dataloader), desc=description)
         grad_context = torch.enable_grad if training else torch.inference_mode
@@ -159,6 +161,18 @@ class Trainer:
 
                 update_wer(wer, outputs, batch, self.text_transform)
 
+                if baseline_wer is not None and "baseline_logits" in outputs:
+                    update_wer(
+                        baseline_wer,
+                        {
+                            "logits": outputs["baseline_logits"],
+                            "input_lengths": outputs["input_lengths"],
+                        },
+                        batch,
+                        self.text_transform,
+                    )
+                    has_baseline = True
+
                 if (step + 1) % logging_steps == 0 or step + 1 == len(dataloader):
                     postfix = {
                         "loss": f"{loss_sum / sample_count:.4f}",
@@ -168,7 +182,11 @@ class Trainer:
                         postfix["lr"] = f"{self.optimizer.param_groups[0]['lr']:.2e}"
                     progress.set_postfix(postfix)
 
-        return {"loss": loss_sum / sample_count, "wer": wer.compute().item()}
+        metrics = {"loss": loss_sum / sample_count, "wer": wer.compute().item()}
+        if has_baseline:
+            metrics["baseline_wer"] = baseline_wer.compute().item()
+
+        return metrics
 
     def run_one_epoch(self, dataloader, training, description):
         return self._run_one_epoch(dataloader, training, description, self._forward)
@@ -282,12 +300,16 @@ class RefinerTrainer(Trainer):
         if self.transform is not None and self.model.training:
             visual_contexts = self.transform(visual_contexts)
 
-        return self.model(
+        outputs = self.model(
             logits,
             visual_contexts,
             labels=batch.get("labels"),
             label_lengths=batch.get("label_lengths"),
         )
+        if not self.model.training:
+            outputs["baseline_logits"] = logits
+
+        return outputs
 
     def run_one_epoch(self, dataloader, training, description):
         self.base_model.eval()

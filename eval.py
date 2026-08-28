@@ -6,7 +6,7 @@ from srcs.nets.e2e import get_model
 from srcs.spm.spm_train import ensure_unigram
 from srcs.spm.text_transofm import TextTransform
 from srcs.trainer.trainer import RefinerTrainer
-from srcs.trainer.utils import create_dataloader, load_config
+from srcs.trainer.utils import create_dataloader, load_config, set_seed
 from train import CONFIG_PATH
 
 
@@ -24,6 +24,7 @@ def main():
     config = load_config(args.config)
     evaluation_config = config["evaluation"]
     seed = config["training"]["seed"]
+    set_seed(seed)
 
     test_dataset = load_vicocktail(
         test_fraction=args.test_fraction,
@@ -68,7 +69,8 @@ def main():
     print(f"Refiner checkpoint: {os.path.abspath(args.checkpoint)}")
     print(f"Test samples: {len(test_dataset)}")
     print(f"Test loss: {metrics['loss']:.6f}")
-    print(f"Test WER: {metrics['wer']:.6f}")
+    print(f"Baseline WER: {metrics['baseline_wer']:.6f}")
+    print(f"Refiner WER: {metrics['wer']:.6f}")
 
 
 if __name__ == "__main__":
