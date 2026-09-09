@@ -39,22 +39,4 @@ def _load_state(path):
 
 def load_weights(model, path):
     state = _load_state(path)
-    target = model.state_dict()
-    state = {
-        key: value
-        for key, value in state.items()
-        if key in target and value.shape == target[key].shape
-    }
-    missing = [key for key in target if key not in state]
-
-    if not state or any(not key.startswith("ctc.") for key in missing):
-        raise RuntimeError(f"No compatible weights found: {path}")
-
-    model.load_state_dict(state, strict=False)
-
-
-def freeze(module):
-    for param in module.parameters():
-        param.requires_grad = False
-
-    module.eval()
+    model.load_state_dict(state)

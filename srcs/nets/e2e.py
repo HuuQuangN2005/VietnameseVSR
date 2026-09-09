@@ -1,115 +1,140 @@
-# Source (modified): https://github.com/mpc001/auto_avsr/blob/main/espnet/nets/pytorch_backend/e2e_asr_conformer.py
-# License: Apache-2.0 (https://github.com/mpc001/auto_avsr/blob/main/LICENSE)
-
-import torch
 import torch.nn as nn
 
-from srcs.nets.backend.ctc import CTC
-from srcs.nets.backend.encoder.conformer_encoder import ConformerEncoder
 from srcs.nets.backend.frontend.resnet import video_resnet
+from srcs.nets.backend.heads.mctc import (
+    CascadedMCTCHead,
+    IndependentMCTCHead,
+    RhymeGuidedMCTCHead,
+)
 from srcs.nets.backend.nets_utils import make_non_pad_mask
-from srcs.nets.backend.refiner.refiner import Refiner
+from srcs.nets.backend.transformer.encoder import TransformerEncoder
+from srcs.nets.loss.mctc import MCTCWELoss
 from srcs.nets.utils import load_weights
 
 
-class VSRModel(nn.Module):
+class VisualEncoder(nn.Module):
     def __init__(
         self,
-        vocab_size,
-        attention_dim=768,
-        attention_heads=12,
-        linear_units=3072,
-        num_blocks=12,
-        dropout_rate=0.1,
-        attention_dropout_rate=0.0,
-        cnn_module_kernel=31,
-        blank_id=0,
-        ignore_id=-1,
+        hidden_dim=256,
+        num_layers=4,
+        num_heads=4,
+        ffn_dim=1024,
+        dropout=0.1,
     ):
         super().__init__()
+        self.output_size = hidden_dim
         self.frontend = video_resnet()
-        self.proj_encoder = nn.Linear(512, attention_dim)
-
-        self.encoder = ConformerEncoder(
-            attention_dim=attention_dim,
-            attention_heads=attention_heads,
-            linear_units=linear_units,
-            num_blocks=num_blocks,
-            dropout_rate=dropout_rate,
-            positional_dropout_rate=dropout_rate,
-            attention_dropout_rate=attention_dropout_rate,
-            cnn_module_kernel=cnn_module_kernel,
+        self.projection = nn.Linear(512, hidden_dim)
+        self.transformer = TransformerEncoder(
+            hidden_dim=hidden_dim,
+            ffn_dim=ffn_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
         )
 
-        self.ctc = CTC(
-            output_size=vocab_size,
-            input_size=attention_dim,
-            dropout_rate=dropout_rate,
-            blank_id=blank_id,
-            ignore_id=ignore_id,
+    def forward(self, videos, video_lengths):
+        features = self.projection(self.frontend(videos))
+        valid_mask = make_non_pad_mask(
+            video_lengths.to(features.device),
+            features.size(1),
         )
+        features = features * valid_mask.unsqueeze(-1)
 
-        self._contexts = None
-        self.encoder.encoders[1].register_forward_hook(
-            self._make_context_hook("h2_features")
+        return self.transformer(features, valid_mask)
+
+
+class IndependentMCTCVSR(nn.Module):
+    def __init__(self, vocab_size, dropout=0.1, **encoder_config):
+        super().__init__()
+        self.encoder = VisualEncoder(dropout=dropout, **encoder_config)
+        self.head = IndependentMCTCHead(
+            input_size=self.encoder.output_size,
+            initial_size=vocab_size["initial"],
+            rhyme_size=vocab_size["rhyme"],
+            tone_size=vocab_size["tone"],
+            dropout=dropout,
         )
-        self.encoder.encoders[3].register_forward_hook(
-            self._make_context_hook("h4_features")
-        )
-
-    def _make_context_hook(self, name):
-        def hook(_module, _inputs, output):
-            if self._contexts is None:
-                return
-
-            hidden = output[0]
-            if isinstance(hidden, tuple):
-                hidden = hidden[0]
-
-            self._contexts[name] = hidden
-
-        return hook
-
-    def encode(self, videos, video_lengths):
-        input_mask = make_non_pad_mask(video_lengths).to(videos.device).unsqueeze(1)
-        visual_features = self.frontend(videos)
-        encoder_inputs = self.proj_encoder(visual_features)
-        encoder_features = self.encoder(encoder_inputs, input_mask)[0]
-
-        return encoder_features, visual_features
-
-    @torch.no_grad()
-    def get_contexts(self, videos, video_lengths):
-        self._contexts = {}
-
-        try:
-            encoder_features, visual_features = self.encode(videos, video_lengths)
-            _, logits = self.ctc(encoder_features, video_lengths)
-
-            visual_contexts = {
-                "visual_features": visual_features,
-                "h2_features": self._contexts["h2_features"],
-                "h4_features": self._contexts["h4_features"],
-                "input_lengths": video_lengths,
-            }
-            return logits, visual_contexts
-        finally:
-            self._contexts = None
+        self.loss_fn = MCTCWELoss()
 
     def forward(self, videos, video_lengths, labels=None, label_lengths=None):
-        encoder_features, _ = self.encode(videos, video_lengths)
-        loss, logits = self.ctc(encoder_features, video_lengths, labels, label_lengths)
+        features = self.encoder(videos, video_lengths)
+        logits = self.head(features)
+        loss = None
 
-        return {"loss": loss, "logits": logits, "input_lengths": video_lengths}
+        if labels is not None:
+            loss = self.loss_fn(logits, labels, video_lengths, label_lengths)
+
+        return {
+            "loss": loss,
+            "logits": logits,
+            "input_lengths": video_lengths,
+        }
 
 
-def get_model(model: str, vocab_size: int, checkpoint=None, **model_config):
-    if model == "auto-vsr":
-        network = VSRModel(vocab_size=vocab_size, **model_config)
-    elif model == "refiner":
-        network = Refiner(vocab_size=vocab_size, **model_config)
-    else:
-        raise ValueError("model must be 'auto-vsr' or 'refiner'.")
+class CascadedMCTCVSR(nn.Module):
+    def __init__(self, vocab_size, dropout=0.1, **encoder_config):
+        super().__init__()
+        self.encoder = VisualEncoder(dropout=dropout, **encoder_config)
+        self.head = CascadedMCTCHead(
+            input_size=self.encoder.output_size,
+            initial_size=vocab_size["initial"],
+            rhyme_size=vocab_size["rhyme"],
+            tone_size=vocab_size["tone"],
+            dropout=dropout,
+        )
+        self.loss_fn = MCTCWELoss()
+
+    def forward(self, videos, video_lengths, labels=None, label_lengths=None):
+        features = self.encoder(videos, video_lengths)
+        logits = self.head(features)
+        loss = None
+
+        if labels is not None:
+            loss = self.loss_fn(logits, labels, video_lengths, label_lengths)
+
+        return {
+            "loss": loss,
+            "logits": logits,
+            "input_lengths": video_lengths,
+        }
+
+
+class RhymeGuidedMCTCVSR(nn.Module):
+    def __init__(self, vocab_size, dropout=0.1, **encoder_config):
+        super().__init__()
+        self.encoder = VisualEncoder(dropout=dropout, **encoder_config)
+        self.head = RhymeGuidedMCTCHead(
+            input_size=self.encoder.output_size,
+            initial_size=vocab_size["initial"],
+            rhyme_size=vocab_size["rhyme"],
+            tone_size=vocab_size["tone"],
+            dropout=dropout,
+        )
+        self.loss_fn = MCTCWELoss()
+
+    def forward(self, videos, video_lengths, labels=None, label_lengths=None):
+        features = self.encoder(videos, video_lengths)
+        logits = self.head(features)
+        loss = None
+
+        if labels is not None:
+            loss = self.loss_fn(logits, labels, video_lengths, label_lengths)
+
+        return {
+            "loss": loss,
+            "logits": logits,
+            "input_lengths": video_lengths,
+        }
+
+
+def get_model(model, vocab_size, checkpoint=None, **model_config):
+    model_classes = {
+        "IndependentMCTCVSR": IndependentMCTCVSR,
+        "CascadedMCTCVSR": CascadedMCTCVSR,
+        "RhymeGuidedMCTCVSR": RhymeGuidedMCTCVSR,
+    }
+    network = model_classes[model](vocab_size=vocab_size, **model_config)
 
     if checkpoint:
         load_weights(network, checkpoint)

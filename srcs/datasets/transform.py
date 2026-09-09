@@ -5,17 +5,6 @@ import random
 
 import torch
 import torchvision
-from torchcodec.decoders import VideoDecoder
-
-
-def load_video(video_source, start_time=0.0, end_time=None):
-    if isinstance(video_source, dict):
-        video_source = video_source.get("bytes") or video_source.get("path")
-
-    decoder = VideoDecoder(video_source, dimension_order="NCHW")
-    end_time = decoder.metadata.duration_seconds if end_time is None else float(end_time)
-
-    return decoder.get_frames_played_in_range(float(start_time), end_time).data
 
 
 class ScaleVideo(torch.nn.Module):

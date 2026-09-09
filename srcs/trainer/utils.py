@@ -1,14 +1,13 @@
 import json
+import math
 import random
 
-
-import math
 import torch
 import yaml
 from torch.utils.data import DataLoader, Sampler
+from torchmetrics.text import WordErrorRate as PhonemeErrorRate
 
-from srcs.datasets.vicocktail import Collator
-from srcs.nets.backend.ctc import ctc_decode
+from srcs.nets.loss.mctc import mctc_decode
 
 
 class LengthBatchSampler(Sampler):
@@ -52,11 +51,11 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def create_dataloader(dataset, text_transform, split, config, shuffle=False):
+def create_dataloader(dataset, collator, config, shuffle=False):
     num_workers = config["num_workers"]
     common_args = {
         "dataset": dataset,
-        "collate_fn": Collator(text_transform, split),
+        "collate_fn": collator,
         "num_workers": num_workers,
         "pin_memory": torch.cuda.is_available(),
         "persistent_workers": num_workers > 0,
@@ -77,18 +76,25 @@ def move_batch(batch, device):
     return {name: value.to(device, non_blocking=True) for name, value in batch.items()}
 
 
-def update_wer(metric, outputs, batch, text_transform):
-    token_ids = ctc_decode(
-        outputs["logits"], outputs["input_lengths"], text_transform.blank_id
-    )
-    hypotheses = [text_transform.decode(item) for item in token_ids]
+def create_metrics(text_transform):
+    return {name: PhonemeErrorRate() for name in text_transform.metric_names}
+
+
+def update_metrics(metrics, outputs, batch, text_transform):
+    token_ids = mctc_decode(outputs["logits"], outputs["input_lengths"])
+    hypotheses = [text_transform.decode_for_metrics(item) for item in token_ids]
     references = [
-        text_transform.decode(label[: int(length)])
+        text_transform.decode_for_metrics(label[: int(length)])
         for label, length in zip(
             batch["labels"].detach().cpu(), batch["label_lengths"].detach().cpu()
         )
     ]
-    metric.update(hypotheses, references)
+
+    for name, metric in metrics.items():
+        metric.update(
+            [values[name] for values in hypotheses],
+            [values[name] for values in references],
+        )
 
 
 def create_grad_scaler(device, enabled=True):

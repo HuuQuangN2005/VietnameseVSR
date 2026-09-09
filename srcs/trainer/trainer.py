@@ -1,37 +1,36 @@
 import os
 
 import torch
-from torchmetrics.text import WordErrorRate
 from tqdm.auto import tqdm
 
-from srcs.nets.utils import freeze
 from srcs.trainer.utils import (
+    create_metrics,
     create_cosine_scheduler,
     create_grad_scaler,
     move_batch,
     optimizer_step_count,
     save_checkpoint,
     save_history,
-    update_wer,
+    update_metrics,
 )
 
 
 class Trainer:
-    def __init__(
-        self, model, optimizer, scheduler, scaler, text_transform, config, amp=True
-    ):
+    def __init__(self, model, text_transform, config):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.scaler = scaler
+        self.optimizer = None
+        self.scheduler = None
+        self.scaler = None
         self.text_transform = text_transform
         self.config = config
-        self.amp = amp
+        self.amp = config.get("amp", True)
         self.model = model.to(self.device)
 
     def build_optimizer(self):
         parameters = [
-            parameter for parameter in self.model.parameters() if parameter.requires_grad
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
         ]
         if not parameters:
             raise ValueError("The model does not contain trainable parameters.")
@@ -60,13 +59,7 @@ class Trainer:
         if self.scaler is None:
             self.scaler = create_grad_scaler(self.device, self.amp)
 
-    def _forward(self, batch):
-        return self.model(**batch)
-
-    def set_model_mode(self, training):
-        self.model.train(training)
-
-    def _run_one_epoch(self, dataloader, training, description, forward):
+    def run_one_epoch(self, dataloader, training, description):
         amp_enabled = self.amp and self.device.type == "cuda"
 
         accumulation_steps = self.config.get("gradient_accumulation_steps", 1)
@@ -88,7 +81,7 @@ class Trainer:
         if len(dataloader) == 0:
             raise ValueError("The dataloader must contain at least one batch.")
 
-        self.set_model_mode(training)
+        self.model.train(training)
 
         if training:
             self.optimizer.zero_grad(set_to_none=True)
@@ -96,10 +89,7 @@ class Trainer:
         sample_count = 0
         loss_sum = 0.0
 
-        wer = WordErrorRate()
-        baseline_wer = WordErrorRate() if not training else None
-        has_baseline = False
-
+        metrics = create_metrics(self.text_transform)
         progress = tqdm(enumerate(dataloader), total=len(dataloader), desc=description)
         grad_context = torch.enable_grad if training else torch.inference_mode
 
@@ -108,9 +98,11 @@ class Trainer:
                 batch = move_batch(batch, self.device)
 
                 with torch.amp.autocast(
-                    device_type=self.device.type, dtype=torch.float16, enabled=amp_enabled
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=amp_enabled,
                 ):
-                    outputs = forward(batch)
+                    outputs = self.model(**batch)
                     loss = outputs["loss"]
 
                 if loss is None:
@@ -146,7 +138,9 @@ class Trainer:
                             previous_scale = self.scaler.get_scale()
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
-                            optimizer_updated = self.scaler.get_scale() >= previous_scale
+                            optimizer_updated = (
+                                self.scaler.get_scale() >= previous_scale
+                            )
                         else:
                             self.optimizer.step()
 
@@ -159,37 +153,24 @@ class Trainer:
                 loss_sum += loss.detach().float().item() * batch_size
                 sample_count += batch_size
 
-                update_wer(wer, outputs, batch, self.text_transform)
-
-                if baseline_wer is not None and "baseline_logits" in outputs:
-                    update_wer(
-                        baseline_wer,
-                        {
-                            "logits": outputs["baseline_logits"],
-                            "input_lengths": outputs["input_lengths"],
-                        },
-                        batch,
-                        self.text_transform,
-                    )
-                    has_baseline = True
+                update_metrics(metrics, outputs, batch, self.text_transform)
 
                 if (step + 1) % logging_steps == 0 or step + 1 == len(dataloader):
                     postfix = {
                         "loss": f"{loss_sum / sample_count:.4f}",
-                        "wer": f"{wer.compute().item():.4f}",
+                        **{
+                            name: f"{metric.compute().item():.4f}"
+                            for name, metric in metrics.items()
+                        },
                     }
                     if training:
                         postfix["lr"] = f"{self.optimizer.param_groups[0]['lr']:.2e}"
                     progress.set_postfix(postfix)
 
-        metrics = {"loss": loss_sum / sample_count, "wer": wer.compute().item()}
-        if has_baseline:
-            metrics["baseline_wer"] = baseline_wer.compute().item()
-
-        return metrics
-
-    def run_one_epoch(self, dataloader, training, description):
-        return self._run_one_epoch(dataloader, training, description, self._forward)
+        return {
+            "loss": loss_sum / sample_count,
+            **{name: metric.compute().item() for name, metric in metrics.items()},
+        }
 
     def train(self, train_dataloader, validation_dataloader, epochs, output_dir):
         if epochs <= 0:
@@ -202,7 +183,7 @@ class Trainer:
         last_path = os.path.join(output_dir, "last.pt")
         history_path = os.path.join(output_dir, "history.json")
 
-        best_wer = float("inf")
+        best_score = float("inf")
         stale_epochs = 0
         history = []
 
@@ -216,10 +197,11 @@ class Trainer:
 
             epoch_metrics = {
                 "epoch": epoch,
-                "train_loss": train_metrics["loss"],
-                "train_wer": train_metrics["wer"],
-                "validation_loss": validation_metrics["loss"],
-                "validation_wer": validation_metrics["wer"],
+                **{f"train_{name}": value for name, value in train_metrics.items()},
+                **{
+                    f"validation_{name}": value
+                    for name, value in validation_metrics.items()
+                },
             }
 
             history.append(epoch_metrics)
@@ -227,11 +209,14 @@ class Trainer:
             save_history(history, history_path)
             save_checkpoint(self.model, last_path, epoch, epoch_metrics)
 
-            improved = validation_metrics["wer"] < (
-                best_wer - self.config["early_stopping_threshold"]
+            validation_score = sum(
+                validation_metrics[name] for name in self.text_transform.metric_names
+            ) / len(self.text_transform.metric_names)
+            improved = validation_score < (
+                best_score - self.config["early_stopping_threshold"]
             )
             if improved:
-                best_wer = validation_metrics["wer"]
+                best_score = validation_score
                 stale_epochs = 0
 
                 save_checkpoint(self.model, best_path, epoch, epoch_metrics)
@@ -243,76 +228,3 @@ class Trainer:
                 break
 
         return history
-
-
-class FinetuneTrainer(Trainer):
-    def __init__(self, model, *args, **kwargs):
-        freeze(model)
-        blocks = model.encoder.encoders
-        blocks[-2:].requires_grad_(True)
-        model.ctc.ctc_lo.requires_grad_(True)
-
-        self.frozen_modules = [
-            model.frontend,
-            model.proj_encoder,
-            model.encoder.embed,
-            *blocks[:-2],
-            model.encoder.after_norm,
-        ]
-        super().__init__(model, *args, **kwargs)
-
-    def set_model_mode(self, training):
-        self.model.train(training)
-
-        for module in self.frozen_modules:
-            module.eval()
-
-    def build_optimizer(self):
-        return torch.optim.AdamW(
-            [
-                {
-                    "params": self.model.encoder.encoders[-2:].parameters(),
-                    "lr": self.config["encoder_lr"],
-                },
-                {
-                    "params": self.model.ctc.ctc_lo.parameters(),
-                    "lr": self.config["ctc_head_lr"],
-                },
-            ],
-            weight_decay=self.config.get("weight_decay", 0.0),
-        )
-
-
-class RefinerTrainer(Trainer):
-    def __init__(self, base_model, refiner, *args, transform=None, **kwargs):
-        super().__init__(refiner, *args, **kwargs)
-
-        self.base_model = base_model
-        freeze(self.base_model)
-        self.base_model.to(self.device)
-        self.transform = transform
-
-    def _forward_refiner(self, batch):
-        logits, visual_contexts = self.base_model.get_contexts(
-            batch["videos"], batch["video_lengths"]
-        )
-
-        if self.transform is not None and self.model.training:
-            visual_contexts = self.transform(visual_contexts)
-
-        outputs = self.model(
-            logits,
-            visual_contexts,
-            labels=batch.get("labels"),
-            label_lengths=batch.get("label_lengths"),
-        )
-        if not self.model.training:
-            outputs["baseline_logits"] = logits
-
-        return outputs
-
-    def run_one_epoch(self, dataloader, training, description):
-        self.base_model.eval()
-        return self._run_one_epoch(
-            dataloader, training, description, self._forward_refiner
-        )
