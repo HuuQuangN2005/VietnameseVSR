@@ -6,19 +6,19 @@ from srcs.datasets.collator import PhonemeCollator
 from srcs.nets.e2e import get_model
 from srcs.nlp.text_transform import PhonemeTransform
 from srcs.trainer.trainer import Trainer
-from srcs.trainer.utils import create_dataloader, load_config, set_seed
+from srcs.trainer.utils import create_data_loader, load_configuration, set_seed
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.yaml")
-CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
+DEFAULT_CONFIGURATION_PATH = os.path.join(PROJECT_ROOT, "config.yaml")
+DEFAULT_CHECKPOINT_DIRECTORY = os.path.join(PROJECT_ROOT, "checkpoints")
 
 
-def parse_args():
+def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=CONFIG_PATH)
+    parser.add_argument("--configuration", default=DEFAULT_CONFIGURATION_PATH)
     parser.add_argument("--checkpoint")
-    parser.add_argument("--output_dir")
-    parser.add_argument("--train_fraction", type=float, default=1.0)
+    parser.add_argument("--output_directory")
+    parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument(
         "--model",
         choices=[
@@ -33,42 +33,52 @@ def parse_args():
 
 
 def main():
-    args = parse_args()
-    config = load_config(args.config)["training"]
-    set_seed(config["seed"])
+    arguments = parse_arguments()
+    training_configuration = load_configuration(arguments.configuration)["training"]
+    set_seed(training_configuration["seed"])
 
-    datasets = load_vicocktail(
+    dataset_splits = load_vicocktail(
         split="train",
-        fraction=args.train_fraction,
-        seed=config["seed"],
+        fraction=arguments.fraction,
+        seed=training_configuration["seed"],
     )
 
-    text_transform = PhonemeTransform(datasets["train"])
+    text_transform = PhonemeTransform(dataset_splits["train"])
     model = get_model(
-        args.model,
+        arguments.model,
         text_transform.vocab_size,
-        checkpoint=args.checkpoint,
+        checkpoint=arguments.checkpoint,
     )
 
-    train_dataloader = create_dataloader(
-        datasets["train"],
+    training_data_loader = create_data_loader(
+        dataset_splits["train"],
         PhonemeCollator("train", text_transform),
-        config,
+        training_configuration,
         shuffle=True,
     )
-    validation_dataloader = create_dataloader(
-        datasets["val"],
+    validation_data_loader = create_data_loader(
+        dataset_splits["val"],
         PhonemeCollator("val", text_transform),
-        config,
+        training_configuration,
     )
 
     trainer = Trainer(
         model=model,
         text_transform=text_transform,
-        config=config,
+        configuration=training_configuration,
     )
-    output_dir = args.output_dir or os.path.join(CHECKPOINT_DIR, args.model)
-    trainer.train(train_dataloader, validation_dataloader, args.epochs, output_dir)
+
+    output_directory = arguments.output_directory or os.path.join(
+        DEFAULT_CHECKPOINT_DIRECTORY,
+        arguments.model,
+    )
+
+    trainer.train(
+        training_data_loader,
+        validation_data_loader,
+        arguments.epochs,
+        output_directory,
+    )
 
 
 if __name__ == "__main__":

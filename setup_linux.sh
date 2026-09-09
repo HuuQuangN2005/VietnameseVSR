@@ -31,3 +31,5 @@ fi
 
 conda activate venv
 python --version
+pip install -r rent_requirements.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu132

@@ -1,13 +1,13 @@
 import torch.nn as nn
 
-from srcs.nets.backend.frontend.resnet import video_resnet
+from srcs.nets.backend.frontend.shufflenet import video_shufflenet
 from srcs.nets.backend.heads.mctc import (
     CascadedMCTCHead,
     IndependentMCTCHead,
     RhymeGuidedMCTCHead,
 )
 from srcs.nets.backend.nets_utils import make_non_pad_mask
-from srcs.nets.backend.transformer.encoder import TransformerEncoder
+from srcs.nets.backend.TCN import TCN
 from srcs.nets.loss.mctc import MCTCWELoss
 from srcs.nets.utils import load_weights
 
@@ -16,20 +16,18 @@ class VisualEncoder(nn.Module):
     def __init__(
         self,
         hidden_dim=256,
-        num_layers=4,
-        num_heads=4,
-        ffn_dim=1024,
+        num_layers=6,
+        kernel_size=3,
         dropout=0.1,
     ):
         super().__init__()
         self.output_size = hidden_dim
-        self.frontend = video_resnet()
-        self.projection = nn.Linear(512, hidden_dim)
-        self.transformer = TransformerEncoder(
-            hidden_dim=hidden_dim,
-            ffn_dim=ffn_dim,
-            num_heads=num_heads,
-            num_layers=num_layers,
+        self.frontend = video_shufflenet()
+        self.projection = nn.Linear(self.frontend.output_size, hidden_dim)
+        self.tcn = TCN(
+            num_inputs=hidden_dim,
+            num_channels=[hidden_dim] * num_layers,
+            kernel_size=kernel_size,
             dropout=dropout,
         )
 
@@ -41,7 +39,7 @@ class VisualEncoder(nn.Module):
         )
         features = features * valid_mask.unsqueeze(-1)
 
-        return self.transformer(features, valid_mask)
+        return self.tcn(features, valid_mask)
 
 
 class IndependentMCTCVSR(nn.Module):
