@@ -137,7 +137,6 @@ class Trainer:
         history_path = os.path.join(output_directory, "history.json")
 
         best_score = float("inf")
-        stale_epochs = 0
         history = []
 
         for epoch in tqdm(range(1, epoch_count + 1), desc="Epochs"):
@@ -166,18 +165,9 @@ class Trainer:
             validation_score = sum(
                 validation_metrics[name] for name in self.text_transform.metric_names
             ) / len(self.text_transform.metric_names)
-            improved = validation_score < (
-                best_score - self.configuration["early_stopping_threshold"]
-            )
-            if improved:
+
+            if validation_score < best_score:
                 best_score = validation_score
-                stale_epochs = 0
                 save_checkpoint(self.model, best_checkpoint_path, epoch, epoch_metrics)
-
-            else:
-                stale_epochs += 1
-
-            if stale_epochs >= self.configuration["early_stopping_patience"]:
-                break
 
         return history

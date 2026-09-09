@@ -7,20 +7,14 @@ import torch.nn.functional as F
 def mctc_decode(logits, input_lengths):
     blank_logits = logits["blank"].float()
     component_logits = [logits[name].float() for name in ("initial", "rhyme", "tone")]
-    nonblank_scores = F.logsigmoid(-blank_logits)
 
-    for component in component_logits:
-        component_scores = F.log_softmax(component, dim=-1)
-        nonblank_scores += component_scores.max(dim=-1).values
-
-    blank_mask = F.logsigmoid(blank_logits) >= nonblank_scores
+    blank_mask = (blank_logits >= 0).cpu()
 
     component_ids = torch.stack(
         [component.argmax(dim=-1) for component in component_logits],
         dim=-1,
     ).cpu()
 
-    blank_mask = blank_mask.cpu()
     input_lengths = input_lengths.detach().cpu().tolist()
 
     sequences = []
@@ -86,10 +80,12 @@ class MCTCWELoss(nn.Module):
             + tone_log_probs
         )
 
-        log_probs = torch.cat(
+        scores = torch.cat(
             [F.logsigmoid(blank_logits).unsqueeze(-1), joint_log_probs],
             dim=-1,
         )
+        normalizer = scores.logsumexp(dim=-1)
+        log_probs = scores - normalizer.unsqueeze(-1)
 
         loss = self.ctc(
             log_probs.transpose(0, 1),
@@ -97,5 +93,9 @@ class MCTCWELoss(nn.Module):
             input_lengths,
             label_lengths,
         )
+
+        frames = torch.arange(scores.size(1), device=scores.device)
+        valid_frames = frames.unsqueeze(0) < input_lengths.to(scores.device).unsqueeze(1)
+        loss = loss - (normalizer * valid_frames).sum()
 
         return loss / labels.size(0)

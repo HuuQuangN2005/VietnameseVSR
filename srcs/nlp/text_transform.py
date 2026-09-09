@@ -20,6 +20,16 @@ BLANK_TOKEN = "<blank>"
 UNK_TOKEN = Tokenizer.unk_token
 
 
+def vocabulary_paths(directory):
+    return {
+        "word_path": os.path.join(directory, "word.txt"),
+        "initial_path": os.path.join(directory, "initial.txt"),
+        "rhyme_path": os.path.join(directory, "rhyme.txt"),
+        "tone_path": os.path.join(directory, "tone.txt"),
+        "lookup_path": os.path.join(directory, "phoneme_lookup.json"),
+    }
+
+
 def load_vocabulary(path):
     with open(path, encoding="utf-8") as file:
         return [line.strip() for line in file if line.strip()]

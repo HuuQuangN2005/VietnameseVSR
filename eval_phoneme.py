@@ -4,7 +4,7 @@ import os
 from srcs.datasets.vicocktail import load_vicocktail
 from srcs.datasets.collator import PhonemeCollator
 from srcs.nets.e2e import get_model
-from srcs.nlp.text_transform import PhonemeTransform
+from srcs.nlp.text_transform import PhonemeTransform, vocabulary_paths
 from srcs.trainer.trainer import Trainer
 from srcs.trainer.utils import create_data_loader, load_configuration, set_seed
 
@@ -42,7 +42,21 @@ def main():
         seed=seed,
     )["test"]
 
-    text_transform = PhonemeTransform()
+    checkpoint_directory = (
+        arguments.checkpoint
+        if os.path.isdir(arguments.checkpoint)
+        else os.path.dirname(os.path.abspath(arguments.checkpoint))
+    )
+    vocabulary_directory = os.path.join(checkpoint_directory, "vocab")
+
+    if not os.path.isdir(vocabulary_directory):
+        raise FileNotFoundError(
+            f"No vocabulary next to the checkpoint: {vocabulary_directory}. "
+            "It is written there by train_phoneme.py; evaluating against a "
+            "different vocabulary silently reports wrong metrics."
+        )
+
+    text_transform = PhonemeTransform(**vocabulary_paths(vocabulary_directory))
 
     model = get_model(
         arguments.model,

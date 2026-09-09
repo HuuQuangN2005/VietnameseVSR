@@ -1,7 +1,7 @@
 training:
   seed: 42
-  batch_size: 32
-  num_workers: 16
+  batch_size: 30
+  num_workers: 10
   gradient_accumulation_steps: 1
   learning_rate: 0.0001
   weight_decay: 0.005
@@ -9,11 +9,9 @@ training:
   max_grad_norm: 5.0
   logging_steps: 25
   amp: true
-  early_stopping_patience: 5
-  early_stopping_threshold: 0.001
 
 evaluation:
-  batch_size: 32
-  num_workers: 16
+  batch_size: 30
+  num_workers: 10
   logging_steps: 25
   amp: true

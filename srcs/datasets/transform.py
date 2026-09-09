@@ -23,15 +23,13 @@ class AdaptiveTimeMask(torch.nn.Module):
         cloned = x.clone()
         length = cloned.size(0)
         n_mask = int((length + self.stride - 0.1) // self.stride)
-        ts = torch.randint(0, self.window, size=(n_mask, 2))
-        for t, t_end in ts:
-            if length - t <= 0:
+        widths = torch.randint(0, self.window, size=(n_mask,))
+        for width in widths:
+            width = int(width)
+            if width <= 0 or length - width <= 0:
                 continue
-            t_start = random.randrange(0, length - t)
-            if t_start == t_start + t:
-                continue
-            t_end += t_start
-            cloned[t_start:t_end] = 0
+            t_start = random.randrange(0, length - width)
+            cloned[t_start : t_start + width] = 0
         return cloned
 
 

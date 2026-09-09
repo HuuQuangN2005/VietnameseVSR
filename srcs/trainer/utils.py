@@ -16,7 +16,9 @@ class LengthBatchSampler(Sampler):
         self.seed = seed
         self.epoch = 0
 
-        indices = sorted(range(len(lengths)), key=lambda index: int(lengths[index]))
+        lengths = [int(value) for value in lengths]
+        indices = sorted(range(len(lengths)), key=lengths.__getitem__)
+
         self.batches = [
             indices[start : start + batch_size]
             for start in range(0, len(indices), batch_size)

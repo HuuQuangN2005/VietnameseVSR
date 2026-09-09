@@ -9,8 +9,6 @@ training:
   max_grad_norm: 5.0
   logging_steps: 25
   amp: true
-  early_stopping_patience: 5
-  early_stopping_threshold: 0.001
 
 evaluation:
   batch_size: 4

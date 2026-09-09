@@ -4,7 +4,7 @@ import os
 from srcs.datasets.vicocktail import load_vicocktail
 from srcs.datasets.collator import PhonemeCollator
 from srcs.nets.e2e import get_model
-from srcs.nlp.text_transform import PhonemeTransform
+from srcs.nlp.text_transform import PhonemeTransform, vocabulary_paths
 from srcs.trainer.trainer import Trainer
 from srcs.trainer.utils import create_data_loader, load_configuration, set_seed
 
@@ -37,13 +37,23 @@ def main():
     training_configuration = load_configuration(arguments.configuration)["training"]
     set_seed(training_configuration["seed"])
 
+    output_directory = arguments.output_directory or os.path.join(
+        DEFAULT_CHECKPOINT_DIRECTORY,
+        arguments.model,
+    )
+    vocabulary_directory = os.path.join(output_directory, "vocab")
+    os.makedirs(vocabulary_directory, exist_ok=True)
+
     dataset_splits = load_vicocktail(
         split="train",
         fraction=arguments.fraction,
         seed=training_configuration["seed"],
     )
 
-    text_transform = PhonemeTransform(dataset_splits["train"])
+    text_transform = PhonemeTransform(
+        dataset_splits["train"],
+        **vocabulary_paths(vocabulary_directory),
+    )
     model = get_model(
         arguments.model,
         text_transform.vocab_size,
@@ -66,11 +76,6 @@ def main():
         model=model,
         text_transform=text_transform,
         configuration=training_configuration,
-    )
-
-    output_directory = arguments.output_directory or os.path.join(
-        DEFAULT_CHECKPOINT_DIRECTORY,
-        arguments.model,
     )
 
     trainer.train(
