@@ -8,7 +8,13 @@ def mctc_decode(logits, input_lengths):
     blank_logits = logits["blank"].float()
     component_logits = [logits[name].float() for name in ("initial", "rhyme", "tone")]
 
-    blank_mask = (blank_logits >= 0).cpu()
+    nonblank_scores = F.logsigmoid(-blank_logits)
+
+    for component in component_logits:
+        component_scores = F.log_softmax(component, dim=-1)
+        nonblank_scores = nonblank_scores + component_scores.max(dim=-1).values
+
+    blank_mask = (F.logsigmoid(blank_logits) >= nonblank_scores).cpu()
 
     component_ids = torch.stack(
         [component.argmax(dim=-1) for component in component_logits],
