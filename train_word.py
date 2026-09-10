@@ -3,9 +3,9 @@ import os
 
 from srcs.datasets.utils import filter_by_length
 from srcs.datasets.vicocktail import load_vicocktail
-from srcs.datasets.collator import PhonemeCollator
+from srcs.datasets.collator import WordCollator
 from srcs.nets.e2e import get_model
-from srcs.nlp.text_transform import PhonemeTransform, vocabulary_paths
+from srcs.nlp.text_transform import WordTransform, vocabulary_paths
 from srcs.trainer.trainer import Trainer
 from srcs.trainer.utils import create_data_loader, load_configuration, set_seed
 
@@ -20,15 +20,7 @@ def parse_arguments():
     parser.add_argument("--checkpoint")
     parser.add_argument("--output_directory")
     parser.add_argument("--fraction", type=float, default=1.0)
-    parser.add_argument(
-        "--model",
-        choices=[
-            "IndependentMCTCVSR",
-            "CascadedMCTCVSR",
-            "RhymeGuidedMCTCVSR",
-        ],
-        default="IndependentMCTCVSR",
-    )
+    parser.add_argument("--model", choices=["WordCTCVSR"], default="WordCTCVSR")
     parser.add_argument("--visual_pretrained")
     parser.add_argument("--max_frames", type=int)
     parser.add_argument("--epochs", type=int, required=True)
@@ -59,9 +51,9 @@ def main():
                 dataset_splits[split], arguments.max_frames
             )
 
-    text_transform = PhonemeTransform(
+    text_transform = WordTransform(
         dataset_splits["train"],
-        **vocabulary_paths(vocabulary_directory),
+        word_path=vocabulary_paths(vocabulary_directory)["word_path"],
     )
     model = get_model(
         arguments.model,
@@ -72,13 +64,13 @@ def main():
 
     training_data_loader = create_data_loader(
         dataset_splits["train"],
-        PhonemeCollator("train", text_transform),
+        WordCollator("train", text_transform),
         training_configuration,
         shuffle=True,
     )
     validation_data_loader = create_data_loader(
         dataset_splits["val"],
-        PhonemeCollator("val", text_transform),
+        WordCollator("val", text_transform),
         training_configuration,
     )
 

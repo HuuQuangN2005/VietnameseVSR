@@ -6,6 +6,10 @@ plans.docx
 
 
 checkpoints/*
+
+# local diagnostic tools, not part of the project
+diagnose_blank.py
+overfit_probe.py
 data/.hf
 data/Vicocktail/
 

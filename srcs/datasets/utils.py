@@ -4,12 +4,14 @@ import torch
 from collections import Counter
 from collections.abc import Sequence
 from torchcodec.decoders import VideoDecoder
-from srcs.nlp.tokenizer import WordTokenizer
+from srcs.nlp.tokenizer import PhonemeTokenizer, WordTokenizer
 
 VALID_WORD_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data", "valid_word.txt"
 )
 word_tokenizer = WordTokenizer()
+phoneme_tokenizer = PhonemeTokenizer()
+DECODE_THREADS = 2
 
 
 def get_word_frequencies(dataset):
@@ -64,11 +66,42 @@ def filter_dataset(dataset, allowed_words):
     return dataset.select(indices)
 
 
+def is_analysable_label(label):
+    words = word_tokenizer.tokenize(to_text(label))
+
+    if not words:
+        return False
+
+    return all(phoneme_tokenizer.analyze(word)["is_valid"] for word in words)
+
+
+def filter_analysable(dataset):
+    indices = [
+        index
+        for index, label in enumerate(dataset["label"])
+        if is_analysable_label(label)
+    ]
+
+    return dataset.select(indices)
+
+
+def filter_by_length(dataset, max_frames):
+    indices = [
+        index
+        for index, length in enumerate(dataset["video_length"])
+        if int(length) <= max_frames
+    ]
+
+    return dataset.select(indices)
+
+
 def load_video(video_source, start_time=0.0, end_time=None):
     if isinstance(video_source, dict):
         video_source = video_source.get("bytes") or video_source.get("path")
 
-    decoder = VideoDecoder(video_source, dimension_order="NCHW")
+    decoder = VideoDecoder(
+        video_source, dimension_order="NCHW", num_ffmpeg_threads=DECODE_THREADS
+    )
     if end_time is None:
         end_time = decoder.metadata.duration_seconds
     else:

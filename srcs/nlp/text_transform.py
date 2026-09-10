@@ -1,5 +1,6 @@
 import json
 import os
+from collections import Counter
 
 import torch
 
@@ -42,13 +43,14 @@ def save_vocabulary(path, vocabulary):
         file.write("\n".join(vocabulary) + "\n")
 
 
-def build_word_vocabulary(train_dataset, path=WORD_PATH):
+def build_word_vocabulary(train_dataset, path=WORD_PATH, min_frequency=1):
     tokenizer = WordTokenizer()
-    words = set()
+    frequencies = Counter()
 
     for label in train_dataset["label"]:
-        words.update(tokenizer.tokenize(label))
+        frequencies.update(tokenizer.tokenize(label))
 
+    words = {word for word, count in frequencies.items() if count >= min_frequency}
     vocabulary = [BLANK_TOKEN, UNK_TOKEN, *sorted(words)]
     save_vocabulary(path, vocabulary)
 
@@ -69,9 +71,14 @@ class TextTransform:
 
 class WordTransform(TextTransform):
     blank_token = BLANK_TOKEN
+    metric_names = ("wer",)
 
-    def __init__(self, word_path=WORD_PATH):
+    def __init__(self, train_dataset=None, word_path=WORD_PATH, min_frequency=5):
         self.tokenizer = WordTokenizer()
+
+        if train_dataset is not None:
+            build_word_vocabulary(train_dataset, word_path, min_frequency)
+
         vocabulary = load_vocabulary(word_path)
 
         self.token2id = {token: index for index, token in enumerate(vocabulary)}
@@ -100,6 +107,9 @@ class WordTransform(TextTransform):
             words.append(self.id2token.get(index, self.unk_token))
 
         return self.tokenizer.detokenize(words)
+
+    def decode_for_metrics(self, ids):
+        return {"wer": self.decode(ids)}
 
 
 class PhonemeTransform(TextTransform):

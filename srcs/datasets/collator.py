@@ -2,7 +2,7 @@ from srcs.datasets.transform import VideoTransform
 from srcs.datasets.utils import load_video, pad_seq, to_text
 
 
-class PhonemeCollator:
+class Collator:
     def __init__(self, split, text_transform):
         self.video_transform = VideoTransform(split)
         self.text_transform = text_transform
@@ -32,3 +32,11 @@ class PhonemeCollator:
             batch["label_lengths"] = label_lengths
 
         return batch
+
+
+class PhonemeCollator(Collator):
+    pass
+
+
+class WordCollator(Collator):
+    pass

@@ -349,7 +349,6 @@ class PhonemeTokenizer(Tokenizer):
 
     def tokenize(self, text):
         tokens = []
-        lookup = self.__load_lookup()
 
         for word in self.to_word(text):
             analysis = self.analyze(word)
@@ -361,10 +360,7 @@ class PhonemeTokenizer(Tokenizer):
             rhyme = self.merge_phoneme(
                 [analysis["glide"], analysis["vowel"], analysis["final"]]
             )
-            phonemes = [analysis["initial"], rhyme, analysis["tone"]]
-            key = self.merge_phoneme(phonemes)
-
-            tokens.append(phonemes if key in lookup else [self.unk_token] * 3)
+            tokens.append([analysis["initial"], rhyme, analysis["tone"]])
 
         return tokens
 

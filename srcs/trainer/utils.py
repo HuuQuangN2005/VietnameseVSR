@@ -7,6 +7,7 @@ import yaml
 from torch.utils.data import DataLoader, Sampler
 from torchmetrics.text import WordErrorRate
 
+from srcs.nets.loss.ctc import ctc_decode
 from srcs.nets.loss.mctc import mctc_decode
 
 
@@ -83,7 +84,10 @@ def get_metric_results(metrics):
 
 
 def update_metrics(metrics, outputs, batch, text_transform):
-    predicted_ids = mctc_decode(outputs["logits"], outputs["input_lengths"])
+    logits = outputs["logits"]
+    decode = mctc_decode if isinstance(logits, dict) else ctc_decode
+
+    predicted_ids = decode(logits, outputs["input_lengths"])
     predictions = [text_transform.decode_for_metrics(ids) for ids in predicted_ids]
 
     references = [
