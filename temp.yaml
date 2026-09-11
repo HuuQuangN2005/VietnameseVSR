@@ -1,9 +1,9 @@
 training:
   seed: 42
-  batch_size: 16
-  num_workers: 6
+  batch_size: 8
+  num_workers: 4
   gradient_accumulation_steps: 1
-  learning_rate: 0.0003
+  lr: 0.0003
   weight_decay: 0.005
   warmup_steps: 0.05
   max_grad_norm: 5.0
@@ -11,7 +11,7 @@ training:
   amp: true
 
 evaluation:
-  batch_size: 16
-  num_workers: 4
+  batch_size: 8
+  num_workers: 2
   logging_steps: 25
   amp: true

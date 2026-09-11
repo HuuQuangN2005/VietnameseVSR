@@ -3,7 +3,7 @@ training:
   batch_size: 16
   num_workers: 6
   gradient_accumulation_steps: 1
-  learning_rate: 0.0003
+  lr: 0.0003
   weight_decay: 0.005
   warmup_steps: 0.05
   max_grad_norm: 5.0

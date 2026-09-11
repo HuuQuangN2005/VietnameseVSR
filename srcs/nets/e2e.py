@@ -1,15 +1,10 @@
 import torch.nn as nn
 
 from srcs.nets.backend.frontend.shufflenet import video_shufflenet
-from srcs.nets.backend.heads.ctc import CTCHead
-from srcs.nets.backend.heads.mctc import (
-    CascadedMCTCHead,
-    IndependentMCTCHead,
-    RhymeGuidedMCTCHead,
-)
+from srcs.nets.backend.decoder.syllabic import SyllabicDecoder
+from srcs.nets.backend.heads.mctc import MCTCHead
 from srcs.nets.backend.nets_utils import make_non_pad_mask
 from srcs.nets.backend.TCN import TCN
-from srcs.nets.loss.ctc import CTCLoss
 from srcs.nets.loss.mctc import MCTCWELoss
 from srcs.nets.utils import load_weights
 
@@ -45,11 +40,11 @@ class VisualEncoder(nn.Module):
         return self.tcn(features, valid_mask)
 
 
-class IndependentMCTCVSR(nn.Module):
+class MCTCVSR(nn.Module):
     def __init__(self, vocab_size, dropout=0.1, **encoder_config):
         super().__init__()
         self.encoder = VisualEncoder(dropout=dropout, **encoder_config)
-        self.head = IndependentMCTCHead(
+        self.head = MCTCHead(
             input_size=self.encoder.output_size,
             initial_size=vocab_size["initial"],
             rhyme_size=vocab_size["rhyme"],
@@ -73,98 +68,99 @@ class IndependentMCTCVSR(nn.Module):
         }
 
 
-class CascadedMCTCVSR(nn.Module):
-    def __init__(self, vocab_size, dropout=0.1, **encoder_config):
+class DecoderVSR(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        dropout=0.1,
+        ctc_weight=0.3,
+        decoder_layers=2,
+        decoder_heads=4,
+        decoder_ffn_dim=512,
+        label_smoothing=0.1,
+        **encoder_config,
+    ):
         super().__init__()
         self.encoder = VisualEncoder(dropout=dropout, **encoder_config)
-        self.head = CascadedMCTCHead(
-            input_size=self.encoder.output_size,
-            initial_size=vocab_size["initial"],
-            rhyme_size=vocab_size["rhyme"],
-            tone_size=vocab_size["tone"],
-            dropout=dropout,
-        )
-        self.loss_fn = MCTCWELoss()
+        self.head = None
+        self.loss_fn = None
 
-    def forward(self, videos, video_lengths, labels=None, label_lengths=None):
-        features = self.encoder(videos, video_lengths)
-        logits = self.head(features)
-        loss = None
+        if ctc_weight > 0.0:
+            self.head = MCTCHead(
+                input_size=self.encoder.output_size,
+                initial_size=vocab_size["initial"],
+                rhyme_size=vocab_size["rhyme"],
+                tone_size=vocab_size["tone"],
+                dropout=dropout,
+            )
+            self.loss_fn = MCTCWELoss()
 
-        if labels is not None:
-            loss = self.loss_fn(logits, labels, video_lengths, label_lengths)
-
-        return {
-            "loss": loss,
-            "logits": logits,
-            "input_lengths": video_lengths,
-        }
-
-
-class RhymeGuidedMCTCVSR(nn.Module):
-    def __init__(self, vocab_size, dropout=0.1, **encoder_config):
-        super().__init__()
-        self.encoder = VisualEncoder(dropout=dropout, **encoder_config)
-        self.head = RhymeGuidedMCTCHead(
-            input_size=self.encoder.output_size,
-            initial_size=vocab_size["initial"],
-            rhyme_size=vocab_size["rhyme"],
-            tone_size=vocab_size["tone"],
-            dropout=dropout,
-        )
-        self.loss_fn = MCTCWELoss()
-
-    def forward(self, videos, video_lengths, labels=None, label_lengths=None):
-        features = self.encoder(videos, video_lengths)
-        logits = self.head(features)
-        loss = None
-
-        if labels is not None:
-            loss = self.loss_fn(logits, labels, video_lengths, label_lengths)
-
-        return {
-            "loss": loss,
-            "logits": logits,
-            "input_lengths": video_lengths,
-        }
-
-
-class WordCTCVSR(nn.Module):
-    def __init__(self, vocab_size, dropout=0.1, **encoder_config):
-        super().__init__()
-        self.encoder = VisualEncoder(dropout=dropout, **encoder_config)
-        self.head = CTCHead(
-            input_size=self.encoder.output_size,
+        self.decoder = SyllabicDecoder(
+            hidden_dim=self.encoder.output_size,
             vocab_size=vocab_size,
+            num_layers=decoder_layers,
+            num_heads=decoder_heads,
+            ffn_dim=decoder_ffn_dim,
             dropout=dropout,
+            label_smoothing=label_smoothing,
         )
-        self.loss_fn = CTCLoss()
+        self.ctc_weight = ctc_weight
 
     def forward(self, videos, video_lengths, labels=None, label_lengths=None):
         features = self.encoder(videos, video_lengths)
-        logits = self.head(features)
-        loss = None
 
-        if labels is not None:
-            loss = self.loss_fn(logits, labels, video_lengths, label_lengths)
+        memory_mask = make_non_pad_mask(
+            video_lengths.to(features.device),
+            features.size(1),
+        )
 
-        return {
-            "loss": loss,
-            "logits": logits,
+        outputs = {
+            "loss": None,
             "input_lengths": video_lengths,
         }
 
+        if self.head is not None:
+            outputs["logits"] = self.head(features)
 
-def get_model(model, vocab_size, checkpoint=None, **model_config):
+        if labels is not None:
+            ce_loss, decoder_logits = self.decoder.compute_loss(
+                features,
+                memory_mask,
+                labels,
+                label_lengths,
+            )
+            loss = (1.0 - self.ctc_weight) * ce_loss
+
+            if self.head is not None:
+                loss = loss + self.ctc_weight * self.loss_fn(
+                    outputs["logits"],
+                    labels,
+                    video_lengths,
+                    label_lengths,
+                )
+
+            outputs["loss"] = loss
+
+            if self.training:
+                outputs["preds"] = self.decoder.teacher_forced_preds(
+                    decoder_logits,
+                    label_lengths,
+                )
+
+        if not self.training:
+            outputs["preds"] = self.decoder.generate(features, memory_mask)
+
+        return outputs
+
+
+def get_model(model, vocab_size, ckpt=None, **model_config):
     model_classes = {
-        "IndependentMCTCVSR": IndependentMCTCVSR,
-        "CascadedMCTCVSR": CascadedMCTCVSR,
-        "RhymeGuidedMCTCVSR": RhymeGuidedMCTCVSR,
-        "WordCTCVSR": WordCTCVSR,
+        "MCTCVSR": MCTCVSR,
+        "DecoderVSR": DecoderVSR,
     }
     network = model_classes[model](vocab_size=vocab_size, **model_config)
 
-    if checkpoint:
-        load_weights(network, checkpoint)
+    if ckpt:
+        load_weights(network, ckpt)
 
     return network

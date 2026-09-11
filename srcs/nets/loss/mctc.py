@@ -2,31 +2,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from srcs.nets.backend.nets_utils import COMP_NAMES
+
 
 @torch.no_grad()
 def mctc_decode(logits, input_lengths):
     blank_logits = logits["blank"].float()
-    component_logits = [logits[name].float() for name in ("initial", "rhyme", "tone")]
+    comp_logits = [logits[name].float() for name in COMP_NAMES]
 
     nonblank_scores = F.logsigmoid(-blank_logits)
 
-    for component in component_logits:
-        component_scores = F.log_softmax(component, dim=-1)
-        nonblank_scores = nonblank_scores + component_scores.max(dim=-1).values
+    for comp in comp_logits:
+        comp_scores = F.log_softmax(comp, dim=-1)
+        nonblank_scores = nonblank_scores + comp_scores.max(dim=-1).values
 
     blank_mask = (F.logsigmoid(blank_logits) >= nonblank_scores).cpu()
 
-    component_ids = torch.stack(
-        [component.argmax(dim=-1) for component in component_logits],
+    comp_ids = torch.stack(
+        [comp.argmax(dim=-1) for comp in comp_logits],
         dim=-1,
     ).cpu()
 
     input_lengths = input_lengths.detach().cpu().tolist()
 
-    sequences = []
+    seqs = []
 
     for sample_ids, sample_blank, length in zip(
-        component_ids,
+        comp_ids,
         blank_mask,
         input_lengths,
     ):
@@ -48,9 +50,9 @@ def mctc_decode(logits, input_lengths):
 
             previous = current_ids
 
-        sequences.append(sequence)
+        seqs.append(sequence)
 
-    return sequences
+    return seqs
 
 
 class MCTCWELoss(nn.Module):
@@ -101,7 +103,9 @@ class MCTCWELoss(nn.Module):
         )
 
         frames = torch.arange(scores.size(1), device=scores.device)
-        valid_frames = frames.unsqueeze(0) < input_lengths.to(scores.device).unsqueeze(1)
+        valid_frames = frames.unsqueeze(0) < input_lengths.to(scores.device).unsqueeze(
+            1
+        )
         loss = loss - (normalizer * valid_frames).sum()
 
         return loss / labels.size(0)

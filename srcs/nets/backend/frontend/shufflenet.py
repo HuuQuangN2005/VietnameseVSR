@@ -1,9 +1,3 @@
-# Source (modified):
-# https://github.com/mpc001/Lipreading_using_Temporal_Convolutional_Networks
-# License: see THIRD_PARTY_LICENSES.md.
-# Kept structurally identical to the upstream ShuffleNetV2 so that the released
-# LRW checkpoints load without any key remapping.
-
 import torch
 import torch.nn as nn
 
@@ -119,9 +113,13 @@ class ShuffleNetV2(nn.Module):
             output_channel = self.stage_out_channels[idxstage + 2]
             for i in range(numrepeat):
                 if i == 0:
-                    features.append(InvertedResidual(input_channel, output_channel, 2, 2))
+                    features.append(
+                        InvertedResidual(input_channel, output_channel, 2, 2)
+                    )
                 else:
-                    features.append(InvertedResidual(input_channel, output_channel, 1, 1))
+                    features.append(
+                        InvertedResidual(input_channel, output_channel, 1, 1)
+                    )
                 input_channel = output_channel
 
         self.features = nn.Sequential(*features)
@@ -154,13 +152,20 @@ class VideoShuffleNet(nn.Module):
 
         self.frontend3D = nn.Sequential(
             nn.Conv3d(
-                1, 24, kernel_size=(5, 7, 7), stride=(1, 2, 2), padding=(2, 3, 3), bias=False
+                1,
+                24,
+                kernel_size=(5, 7, 7),
+                stride=(1, 2, 2),
+                padding=(2, 3, 3),
+                bias=False,
             ),
             nn.BatchNorm3d(24),
             activation,
             nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
         )
-        self.trunk = nn.Sequential(network.features, network.conv_last, network.globalpool)
+        self.trunk = nn.Sequential(
+            network.features, network.conv_last, network.globalpool
+        )
 
     def forward(self, videos):
         batch_size = videos.size(0)

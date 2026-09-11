@@ -1,11 +1,7 @@
 from abc import ABC, abstractmethod
 import json
-import os
 import re
 import unicodedata
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-PHONEME_LOOKUP_PATH = os.path.join(DATA_DIR, "phoneme_lookup.json")
 
 
 class Tokenizer(ABC):
@@ -46,7 +42,7 @@ class WordTokenizer(Tokenizer):
 
 class PhonemeTokenizer(Tokenizer):
     def __init__(self, lookup_path=None):
-        self.lookup_path = lookup_path or PHONEME_LOOKUP_PATH
+        self.lookup_path = lookup_path
         self.lookup = None
 
         self.initials = {
@@ -121,6 +117,9 @@ class PhonemeTokenizer(Tokenizer):
 
     def __load_lookup(self):
         if self.lookup is None:
+            if not self.lookup_path:
+                raise ValueError("detokenize needs a lookup_path.")
+
             with open(self.lookup_path, encoding="utf-8") as file:
                 self.lookup = json.load(file)
 

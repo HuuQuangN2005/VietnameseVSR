@@ -36,7 +36,3 @@ class Collator:
 
 class PhonemeCollator(Collator):
     pass
-
-
-class WordCollator(Collator):
-    pass

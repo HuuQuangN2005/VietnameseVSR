@@ -1,6 +1,3 @@
-# Source (modified): https://github.com/nguyenvulebinh/AVSRCocktail/blob/main/src/dataset/av_dataset.py
-# License: CC BY-NC 4.0 (https://github.com/nguyenvulebinh/AVSRCocktail/blob/main/LICENSE)
-
 from datasets import DatasetDict, load_dataset
 
 from srcs.datasets.utils import (
@@ -32,14 +29,14 @@ def load_vicocktail(
         train_dataset = train_dataset.train_test_split(test_size=val_size, seed=seed)
 
         train_split = train_dataset["train"]
-        validation_split = train_dataset["test"]
+        val_split = train_dataset["test"]
 
         if apply_filter:
             train_split = filter_analysable(train_split)
-            validation_split = filter_analysable(validation_split)
+            val_split = filter_analysable(val_split)
 
         outputs["train"] = select_fraction(train_split, fraction, seed)
-        outputs["val"] = select_fraction(validation_split, fraction, seed)
+        outputs["val"] = select_fraction(val_split, fraction, seed)
 
     if split in ("test", "all"):
         test_dataset = load_dataset(DS_NAME, split="test", streaming=False)

@@ -11,16 +11,14 @@ class PositionalEncoding(nn.Module):
 
         positions = torch.arange(max_length, dtype=torch.float32).unsqueeze(1)
 
-        frequencies = torch.exp(
+        freqs = torch.exp(
             torch.arange(0, hidden_dim, 2, dtype=torch.float32)
             * (-math.log(10000.0) / hidden_dim)
         )
 
         encoding = torch.zeros(max_length, hidden_dim)
-        encoding[:, 0::2] = torch.sin(positions * frequencies)
-        encoding[:, 1::2] = torch.cos(
-            positions * frequencies[: encoding[:, 1::2].size(1)]
-        )
+        encoding[:, 0::2] = torch.sin(positions * freqs)
+        encoding[:, 1::2] = torch.cos(positions * freqs[: encoding[:, 1::2].size(1)])
 
         self.register_buffer("encoding", encoding.unsqueeze(0), persistent=False)
 

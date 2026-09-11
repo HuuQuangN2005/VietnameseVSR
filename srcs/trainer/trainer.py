@@ -3,60 +3,79 @@ import os
 import torch
 from tqdm.auto import tqdm
 
+from srcs.nets.loss.mctc import mctc_decode
+
 from srcs.trainer.utils import (
-    create_learning_rate_scheduler,
+    create_lr_scheduler,
     create_metrics,
     get_metric_results,
     move_batch,
-    save_checkpoint,
+    load_history,
+    save_ckpt,
     save_history,
-    update_metrics,
 )
 
 
 class Trainer:
-    def __init__(self, model, text_transform, configuration):
+    def __init__(self, model, text_transform, configs):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
         self.text_transform = text_transform
-        self.configuration = configuration
-        self.use_amp = configuration.get("amp", True) and self.device.type == "cuda"
+        self.configs = configs
+        self.use_amp = configs.get("amp", True) and self.device.type == "cuda"
         self.optimizer = None
         self.scheduler = None
         self.scaler = None
 
-    def setup_training(self, data_loader, epoch_count):
-        parameters = [
-            parameter
-            for parameter in self.model.parameters()
-            if parameter.requires_grad
-        ]
+    def setup_training(self, loader, epoch_count):
+        parameters = [param for param in self.model.parameters() if param.requires_grad]
 
         self.optimizer = torch.optim.AdamW(
             parameters,
-            lr=self.configuration["learning_rate"],
-            weight_decay=self.configuration.get("weight_decay", 0.0),
+            lr=self.configs["lr"],
+            weight_decay=self.configs.get("weight_decay", 0.0),
         )
 
-        accumulation_steps = self.configuration.get("gradient_accumulation_steps", 1)
+        accum_steps = self.configs.get("gradient_accumulation_steps", 1)
 
-        self.scheduler = create_learning_rate_scheduler(
+        self.scheduler = create_lr_scheduler(
             self.optimizer,
-            data_loader,
+            loader,
             epoch_count,
-            accumulation_steps,
-            self.configuration.get("warmup_steps", 0),
+            accum_steps,
+            self.configs.get("warmup_steps", 0),
         )
 
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
 
-    def update_model(self, loss, update_parameters):
+    def decode(self, outputs):
+        raise NotImplementedError
+
+    def update_metrics(self, metrics, outputs, batch):
+        preds = [
+            self.text_transform.decode_for_metrics(ids) for ids in self.decode(outputs)
+        ]
+        references = [
+            self.text_transform.decode_for_metrics(label[: int(length)])
+            for label, length in zip(
+                batch["labels"].detach().cpu(),
+                batch["label_lengths"].detach().cpu(),
+            )
+        ]
+
+        for name, metric in metrics.items():
+            metric.update(
+                [prediction[name] for prediction in preds],
+                [reference[name] for reference in references],
+            )
+
+    def update_model(self, loss, update_params):
         self.scaler.scale(loss).backward()
-        if not update_parameters:
+        if not update_params:
             return
 
         self.scaler.unscale_(self.optimizer)
-        max_gradient_norm = self.configuration.get("max_grad_norm", 0.0)
+        max_gradient_norm = self.configs.get("max_grad_norm", 0.0)
 
         if max_gradient_norm > 0.0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_gradient_norm)
@@ -68,20 +87,20 @@ class Trainer:
         if self.scaler.get_scale() >= previous_scale:
             self.scheduler.step()
 
-    def run_epoch(self, data_loader, training, description):
+    def run_epoch(self, loader, training, desc):
         self.model.train(training)
         if training:
             self.optimizer.zero_grad(set_to_none=True)
 
-        accumulation_steps = self.configuration.get("gradient_accumulation_steps", 1)
-        logging_steps = self.configuration.get("logging_steps", 25)
-        batch_count = len(data_loader)
+        accum_steps = self.configs.get("gradient_accumulation_steps", 1)
+        logging_steps = self.configs.get("logging_steps", 25)
+        batch_count = len(loader)
         sample_count = 0
         total_loss = 0.0
 
         metrics = create_metrics(self.text_transform)
 
-        progress = tqdm(data_loader, desc=description)
+        progress = tqdm(loader, desc=desc)
 
         with torch.set_grad_enabled(training):
             for batch_number, batch in enumerate(progress, start=1):
@@ -93,81 +112,119 @@ class Trainer:
                     loss = outputs["loss"]
 
                 if training:
-                    group_start = (batch_number - 1) // accumulation_steps
-                    remaining_batches = batch_count - group_start * accumulation_steps
-                    group_size = min(accumulation_steps, remaining_batches)
+                    group_start = (batch_number - 1) // accum_steps
+                    remaining_batches = batch_count - group_start * accum_steps
+                    group_size = min(accum_steps, remaining_batches)
 
-                    update_parameters = (
-                        batch_number % accumulation_steps == 0
-                        or batch_number == batch_count
+                    update_params = (
+                        batch_number % accum_steps == 0 or batch_number == batch_count
                     )
 
-                    self.update_model(loss / group_size, update_parameters)
+                    self.update_model(loss / group_size, update_params)
 
                 batch_size = batch["videos"].size(0)
                 total_loss += loss.detach().float().item() * batch_size
                 sample_count += batch_size
 
-                update_metrics(metrics, outputs, batch, self.text_transform)
+                self.update_metrics(metrics, outputs, batch)
 
                 if batch_number % logging_steps == 0 or batch_number == batch_count:
                     progress_values = get_metric_results(metrics)
                     progress_values["loss"] = total_loss / sample_count
                     if training:
-                        progress_values["learning_rate"] = self.optimizer.param_groups[
-                            0
-                        ]["lr"]
+                        progress_values["lr"] = self.optimizer.param_groups[0]["lr"]
 
                     progress.set_postfix(progress_values)
 
         return {"loss": total_loss / sample_count, **get_metric_results(metrics)}
 
+    def resume_from(self, file_path, history):
+        state = torch.load(file_path, map_location=self.device, weights_only=False)
+
+        self.model.load_state_dict(state["model"])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+        self.scaler.load_state_dict(state["scaler"])
+
+        epoch = state["epoch"]
+        history[:] = [entry for entry in history if entry["epoch"] <= epoch]
+        best_score = (float("inf"), float("inf"))
+
+        for entry in history:
+            score = (
+                sum(
+                    entry[f"validation_{name}"]
+                    for name in self.text_transform.metric_names
+                )
+                / len(self.text_transform.metric_names),
+                entry["validation_loss"],
+            )
+            best_score = min(best_score, score)
+
+        return epoch, best_score
+
     def train(
         self,
-        training_data_loader,
-        validation_data_loader,
+        train_loader,
+        val_loader,
         epoch_count,
-        output_directory,
+        output_dir,
+        resume=False,
     ):
-        self.setup_training(training_data_loader, epoch_count)
-        os.makedirs(output_directory, exist_ok=True)
+        self.setup_training(train_loader, epoch_count)
+        os.makedirs(output_dir, exist_ok=True)
 
-        best_checkpoint_path = os.path.join(output_directory, "best.pt")
-        last_checkpoint_path = os.path.join(output_directory, "last.pt")
-        history_path = os.path.join(output_directory, "history.json")
+        best_ckpt_path = os.path.join(output_dir, "best.pt")
+        last_ckpt_path = os.path.join(output_dir, "last.pt")
+        history_path = os.path.join(output_dir, "history.json")
 
-        best_score = float("inf")
+        best_score = (float("inf"), float("inf"))
         history = []
+        start_epoch = 0
 
-        for epoch in tqdm(range(1, epoch_count + 1), desc="Epochs"):
-            training_metrics = self.run_epoch(training_data_loader, True, "Training")
+        if resume and os.path.isfile(last_ckpt_path):
+            history = load_history(history_path)
+            start_epoch, best_score = self.resume_from(last_ckpt_path, history)
+            print(f"resumed from epoch {start_epoch}, best score {best_score}")
 
-            validation_metrics = self.run_epoch(
-                validation_data_loader, False, "Validation"
-            )
+        for epoch in tqdm(
+            range(start_epoch + 1, epoch_count + 1),
+            initial=start_epoch,
+            total=epoch_count,
+            desc="Epochs",
+        ):
+            train_metrics = self.run_epoch(train_loader, True, "Training")
+
+            val_metrics = self.run_epoch(val_loader, False, "Validation")
 
             epoch_metrics = {
                 "epoch": epoch,
-                **{
-                    f"training_{name}": value
-                    for name, value in training_metrics.items()
-                },
-                **{
-                    f"validation_{name}": value
-                    for name, value in validation_metrics.items()
-                },
+                **{f"training_{name}": value for name, value in train_metrics.items()},
+                **{f"validation_{name}": value for name, value in val_metrics.items()},
             }
 
             history.append(epoch_metrics)
             save_history(history, history_path)
-            save_checkpoint(self.model, last_checkpoint_path, epoch, epoch_metrics)
+            save_ckpt(self.model, last_ckpt_path, epoch, epoch_metrics, self)
 
-            validation_score = sum(
-                validation_metrics[name] for name in self.text_transform.metric_names
-            ) / len(self.text_transform.metric_names)
+            val_score = (
+                sum(val_metrics[name] for name in self.text_transform.metric_names)
+                / len(self.text_transform.metric_names),
+                val_metrics["loss"],
+            )
 
-            if validation_score < best_score:
-                best_score = validation_score
-                save_checkpoint(self.model, best_checkpoint_path, epoch, epoch_metrics)
+            if val_score < best_score:
+                best_score = val_score
+                save_ckpt(self.model, best_ckpt_path, epoch, epoch_metrics)
 
         return history
+
+
+class EncoderTrainer(Trainer):
+    def decode(self, outputs):
+        return mctc_decode(outputs["logits"], outputs["input_lengths"])
+
+
+class DecoderTrainer(Trainer):
+    def decode(self, outputs):
+        return outputs["preds"]

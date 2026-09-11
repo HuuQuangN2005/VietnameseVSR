@@ -1,69 +1,12 @@
-import os
 import torch
 
-from collections import Counter
 from collections.abc import Sequence
 from torchcodec.decoders import VideoDecoder
 from srcs.nlp.tokenizer import PhonemeTokenizer, WordTokenizer
 
-VALID_WORD_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "data", "valid_word.txt"
-)
 word_tokenizer = WordTokenizer()
 phoneme_tokenizer = PhonemeTokenizer()
 DECODE_THREADS = 2
-
-
-def get_word_frequencies(dataset):
-    word_frequencies = Counter()
-
-    for label in dataset["label"]:
-        text = to_text(label)
-        words = word_tokenizer.tokenize(text)
-
-        for word in words:
-            word_frequencies[word] += 1
-
-    return word_frequencies
-
-
-def load_valid_words(path=VALID_WORD_PATH):
-    words = set()
-
-    with open(path, encoding="utf-8") as file:
-        for line in file:
-            words.update(word_tokenizer.tokenize(line))
-
-    if not words:
-        raise ValueError("The valid word vocabulary must not be empty.")
-
-    return words
-
-
-def is_valid_label(label, allowed_words):
-    text = to_text(label)
-    words = word_tokenizer.tokenize(text)
-
-    if not words:
-        return False
-
-    for word in words:
-        if word not in allowed_words:
-            return False
-
-    return True
-
-
-def filter_dataset(dataset, allowed_words):
-    indices = []
-
-    for index, label in enumerate(dataset["label"]):
-        is_valid = is_valid_label(label, allowed_words)
-
-        if is_valid:
-            indices.append(index)
-
-    return dataset.select(indices)
 
 
 def is_analysable_label(label):
@@ -117,17 +60,17 @@ def to_text(value):
     return str(value)
 
 
-def pad_seq(sequences: Sequence[torch.Tensor], padding_value=0.0):
-    if not sequences:
+def pad_seq(seqs: Sequence[torch.Tensor], padding_value=0.0):
+    if not seqs:
         raise ValueError("sequences must not be empty")
 
-    lengths = torch.tensor([item.size(0) for item in sequences], dtype=torch.long)
+    lengths = torch.tensor([item.size(0) for item in seqs], dtype=torch.long)
     max_length = int(lengths.max())
-    shape = (len(sequences), max_length, *sequences[0].shape[1:])
+    shape = (len(seqs), max_length, *seqs[0].shape[1:])
 
-    output = sequences[0].new_full(shape, padding_value)
+    output = seqs[0].new_full(shape, padding_value)
 
-    for index, item in enumerate(sequences):
+    for index, item in enumerate(seqs):
         output[index, : item.size(0)] = item
 
     return output, lengths

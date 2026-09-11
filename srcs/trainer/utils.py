@@ -1,14 +1,12 @@
 import json
 import math
+import os
 import random
 
 import torch
 import yaml
 from torch.utils.data import DataLoader, Sampler
 from torchmetrics.text import WordErrorRate
-
-from srcs.nets.loss.ctc import ctc_decode
-from srcs.nets.loss.mctc import mctc_decode
 
 
 class LengthBatchSampler(Sampler):
@@ -36,7 +34,7 @@ class LengthBatchSampler(Sampler):
         return len(self.batches)
 
 
-def load_configuration(file_path):
+def load_configs(file_path):
     with open(file_path, encoding="utf-8") as file:
         return yaml.safe_load(file)
 
@@ -48,13 +46,13 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def create_data_loader(dataset, collator, configuration, shuffle=False):
-    worker_count = configuration["num_workers"]
+def create_loader(dataset, collator, configs, shuffle=False):
+    worker_count = configs["num_workers"]
     batch_sampler = LengthBatchSampler(
         dataset["video_length"],
-        configuration["batch_size"],
+        configs["batch_size"],
         shuffle,
-        configuration.get("seed", 42),
+        configs.get("seed", 42),
     )
 
     options = {
@@ -83,35 +81,11 @@ def get_metric_results(metrics):
     return {name: metric.compute().item() for name, metric in metrics.items()}
 
 
-def update_metrics(metrics, outputs, batch, text_transform):
-    logits = outputs["logits"]
-    decode = mctc_decode if isinstance(logits, dict) else ctc_decode
-
-    predicted_ids = decode(logits, outputs["input_lengths"])
-    predictions = [text_transform.decode_for_metrics(ids) for ids in predicted_ids]
-
-    references = [
-        text_transform.decode_for_metrics(label[: int(length)])
-        for label, length in zip(
-            batch["labels"].detach().cpu(),
-            batch["label_lengths"].detach().cpu(),
-        )
-    ]
-
-    for name, metric in metrics.items():
-        metric.update(
-            [prediction[name] for prediction in predictions],
-            [reference[name] for reference in references],
-        )
-
-
-def create_learning_rate_scheduler(
-    optimizer, data_loader, epoch_count, accumulation_steps, warmup
-):
-    total_steps = math.ceil(len(data_loader) / accumulation_steps) * epoch_count
+def create_lr_scheduler(optimizer, loader, epoch_count, accum_steps, warmup):
+    total_steps = math.ceil(len(loader) / accum_steps) * epoch_count
     warmup_steps = round(total_steps * warmup) if warmup < 1.0 else int(warmup)
 
-    def learning_rate_scale(step):
+    def lr_scale(step):
         if step < warmup_steps:
             return (step + 1) / max(1, warmup_steps)
 
@@ -119,12 +93,26 @@ def create_learning_rate_scheduler(
 
         return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_scale)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
 
 
-def save_checkpoint(model, file_path, epoch, metrics):
+def save_ckpt(model, file_path, epoch, metrics, trainer=None):
     state = {"model": model.state_dict(), "epoch": epoch, "metrics": metrics}
+
+    if trainer is not None:
+        state["optimizer"] = trainer.optimizer.state_dict()
+        state["scheduler"] = trainer.scheduler.state_dict()
+        state["scaler"] = trainer.scaler.state_dict()
+
     torch.save(state, file_path)
+
+
+def load_history(file_path):
+    if not os.path.isfile(file_path):
+        return []
+
+    with open(file_path, encoding="utf-8") as file:
+        return json.load(file)
 
 
 def save_history(history, file_path):

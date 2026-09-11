@@ -117,3 +117,34 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+# Lipreading using Temporal Convolutional Networks
+
+Source: https://github.com/mpc001/Lipreading_using_Temporal_Convolutional_Networks
+
+Used by: `srcs/nets/backend/frontend/shufflenet.py`
+
+The ShuffleNetV2 frontend and the 3D convolutional stem are kept structurally
+identical to the upstream implementation so that the released LRW checkpoints
+load without any key remapping. See the upstream repository for its licence
+terms.
+
+# auto_avsr
+
+Source: https://github.com/mpc001/auto_avsr/blob/main/datamodule/transforms.py
+
+Used by: `srcs/datasets/transform.py`
+
+Licence: Apache-2.0 — https://github.com/mpc001/auto_avsr/blob/main/LICENSE
+
+# AVSRCocktail
+
+Source: https://github.com/nguyenvulebinh/AVSRCocktail/blob/main/src/dataset/av_dataset.py
+
+Used by: `srcs/datasets/vicocktail.py`
+
+Licence: CC BY-NC 4.0 — https://github.com/nguyenvulebinh/AVSRCocktail/blob/main/LICENSE
+
+Note: this licence is non-commercial. It also covers the ViCocktail dataset
+itself, which the whole project depends on.

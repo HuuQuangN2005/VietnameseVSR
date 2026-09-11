@@ -1,6 +1,3 @@
-# Source (modified): https://github.com/mpc001/auto_avsr/blob/main/datamodule/transforms.py
-# License: Apache-2.0 (https://github.com/mpc001/auto_avsr/blob/main/LICENSE)
-
 import random
 
 import torch
